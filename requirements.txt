@@ -1,0 +1,7 @@
+# pygame-ce keeps the public ``pygame`` API, with current CPython support.
+pygame-ce>=2.5,<3
+ruff>=0.14,<1
+coverage>=7.10,<8
+debugpy>=1.8,<2
+# Rebuilds Undertow's small Pixel Operator glyph adjustment.
+fonttools>=4.65,<5

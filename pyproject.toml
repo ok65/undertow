@@ -1,0 +1,4 @@
+[tool.undertow]
+pane_layout = { "version" = 1, "workspace_pane_model" = 2, "active_pane" = "pane-1aa", "next_pane_id" = 4, "root" = { "id" = "pane-1", "type" = "split", "axis" = "vertical", "ratio" = 0.6334405144694534, "first" = { "id" = "pane-1a", "type" = "split", "axis" = "vertical", "ratio" = 0.3001277139208174, "first" = { "id" = "pane-1aa", "type" = "project", "config" = { "root" = "C:\\Users\\olive\\OneDrive\\New Folder Org\\Oliver\\Projects\\Software\\codr2" } }, "second" = { "id" = "pane-3", "type" = "code", "config" = { "path" = "C:\\Users\\olive\\OneDrive\\New Folder Org\\Oliver\\Projects\\Software\\codr2\\scratch.py", "row" = 9, "col" = 12, "scroll" = 0, "target_scroll" = 0, "horizontal_scroll" = 0, "selection_anchor" = [9, 12] } } }, "second" = { "id" = "pane-2", "type" = "output", "config" = { "scroll" = 0, "follow" = true } } } }
+name = "Undertow"
+entrypoint = "main.py"
