@@ -23,7 +23,7 @@ class InspectorPane(Pane):
     def draw(self, renderer: Any, rect: pygame.Rect) -> None:
         """Draw the ranked project-health report for this inspector pane."""
         state = "SCANNING" if renderer.project_inspector.is_busy else f"{renderer.project_inspector.report.issue_count} ISSUES"
-        renderer.panel(rect, renderer.pane_title("INSP", renderer.project.name), renderer.active_pane == self.pane_id)
+        renderer.panel(rect, renderer.pane_title("INSP", renderer.runtime.project.name), renderer.active_pane == self.pane_id)
         renderer.text(renderer.screen, state, (rect.right - 116, rect.y + 12), CYAN if renderer.project_inspector.is_busy else DIM)
         rows = self.rows(renderer)
         if not rows:
@@ -41,7 +41,7 @@ class InspectorPane(Pane):
                 renderer.text(renderer.screen, f"{value.code} // {value.title} ({value.total})", (row.x + 4, row.y + 2), color)
             else:
                 try:
-                    name = value.path.relative_to(renderer.project.root)
+                    name = value.path.relative_to(renderer.runtime.project.root)
                 except ValueError:
                     name = value.path.name
                 selected = self.offender_at(renderer, rect, pygame.mouse.get_pos()) == value
@@ -88,5 +88,7 @@ class InspectorPane(Pane):
             editor.col = 0
             pane_rect = renderer.pane_rects.get(renderer.active_pane)
             if pane_rect is not None:
-                renderer.ensure_caret_visible(editor, pane_rect)
+                pane = renderer.active_editor_pane()
+                if pane is not None:
+                    pane.ensure_caret_visible(renderer, pane_rect)
         return True

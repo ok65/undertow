@@ -76,6 +76,7 @@ class PythonSyntaxHighlighter:
     def __init__(self) -> None:
         self._compiled_rules = tuple((rule, rule.compiled()) for rule in self.rules)
         self._document_caches: dict[int, _HighlightCache] = {}
+        self.last_recomputed_range: tuple[int, int] | None = None
 
     @staticmethod
     def _comment_start(line: str) -> int | None:
@@ -203,7 +204,7 @@ class PythonSyntaxHighlighter:
                 occupied[index] = True
         return sorted(accepted, key=lambda span: span.start)
 
-    def spans_for_lines(self, lines: list[str]) -> list[list[SyntaxSpan]]:
+    def spans_for_lines(self, lines: list[str], dirty_from: int | None = None) -> list[list[SyntaxSpan]]:
         """Return cached syntax spans, rescanning only from the changed line.
 
         Triple strings are the only stateful rule. Once a later unchanged line
@@ -215,15 +216,24 @@ class PythonSyntaxHighlighter:
         if cache is None or cache.source is not lines:
             cache = _HighlightCache(lines, [], [], [])
             self._document_caches[key] = cache
+        if dirty_from == -1 and cache.lines:
+            self.last_recomputed_range = None
+            return cache.spans
         unchanged = min(len(lines), len(cache.lines))
-        first_changed = next((index for index in range(unchanged) if lines[index] != cache.lines[index]), unchanged)
+        first_changed = (
+            min(max(0, dirty_from), unchanged)
+            if dirty_from is not None
+            else next((index for index in range(unchanged) if lines[index] != cache.lines[index]), unchanged)
+        )
         if first_changed == len(lines) == len(cache.lines):
+            self.last_recomputed_range = None
             return cache.spans
 
         delimiter = cache.end_states[first_changed - 1] if first_changed else None
         new_lines = cache.lines[:first_changed]
         new_spans = cache.spans[:first_changed]
         new_end_states = cache.end_states[:first_changed]
+        last_recomputed = first_changed
         for index in range(first_changed, len(lines)):
             # A same-sized document can reuse its unchanged suffix once the
             # state flowing into it is identical again.
@@ -238,5 +248,7 @@ class PythonSyntaxHighlighter:
             new_lines.append(lines[index])
             new_spans.append(self.spans(lines[index], regions))
             new_end_states.append(delimiter)
+            last_recomputed = index + 1
         cache.lines, cache.spans, cache.end_states = new_lines, new_spans, new_end_states
+        self.last_recomputed_range = first_changed, last_recomputed
         return cache.spans

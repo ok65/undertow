@@ -5,6 +5,7 @@ from typing import Any
 
 from undertow.theme import CYAN, INK, KEYWORD
 from undertow.workspace import Pane
+from undertow.context_actions import ContextAction
 
 
 @dataclass(init=False)
@@ -34,3 +35,6 @@ class OutputPane(Pane):
         for number, line in enumerate(renderer.output[self.scroll:self.scroll + max_lines]):
             color = CYAN if line.startswith(">") else KEYWORD if line.startswith(("Traceback", "! ")) or "Error:" in line else INK
             renderer.text(renderer.screen, line[:120], (rect.x + 12, rect.y + 43 + number * 24), color)
+
+    def pane_context_actions(self, app: Any, pane: Any = None) -> list[ContextAction]:
+        return [ContextAction("clear_output", "CLEAR OUTPUT", lambda owner, _pane: owner.clear_output())]

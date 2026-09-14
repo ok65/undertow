@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import random
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 import pygame
 
 from .editor import Editor
-from .function_info import FunctionInfo, function_at
+from .function_info import FunctionIndex, FunctionInfo, function_at
 from .linting import Diagnostic
-from .panes import ProjectPane, StructurePane
+from .panes import EditorPane, ProjectPane, StructurePane
 from .theme import (
     BLACK,
     COMMENT,
@@ -68,12 +69,32 @@ class RendererMixin:
         # a malformed/restored layout from taking down the entire IDE.
         if rect.w <= 0 or rect.h <= 0:
             return
-        glass = pygame.Surface(rect.size, pygame.SRCALPHA)
-        glass.fill((4, 10, 16, 184))
+        # Pane backgrounds are invariant for a given size. Reusing these
+        # alpha surfaces avoids allocating and clearing several large buffers
+        # on every frame while a split layout is idle or scrolling.
+        glass_cache = getattr(self, "_panel_glass_cache", None)
+        header_cache = getattr(self, "_panel_header_cache", None)
+        if glass_cache is None or header_cache is None:
+            glass_cache, header_cache = {}, {}
+            self._panel_glass_cache = glass_cache
+            self._panel_header_cache = header_cache
+        glass = glass_cache.get(rect.size)
+        if glass is None:
+            glass = pygame.Surface(rect.size, pygame.SRCALPHA)
+            glass.fill((4, 10, 16, 184))
+            glass_cache[rect.size] = glass
+            if len(glass_cache) > 64:
+                glass_cache.pop(next(iter(glass_cache)))
+        header_size = rect.w, 34
+        header = header_cache.get(header_size)
+        if header is None:
+            header = pygame.Surface(header_size, pygame.SRCALPHA)
+            header.fill((*PANEL_ALT, 224))
+            header_cache[header_size] = header
+            if len(header_cache) > 64:
+                header_cache.pop(next(iter(header_cache)))
         self.screen.blit(glass, rect.topleft)
         pygame.draw.rect(self.screen, STEEL_BORDER, rect, 1)
-        header = pygame.Surface((rect.w, 34), pygame.SRCALPHA)
-        header.fill((*PANEL_ALT, 224))
         self.screen.blit(header, rect.topleft)
         self.text(self.screen, title, (rect.x + 12, rect.y + 8), INK, True)
         if active:
@@ -87,25 +108,38 @@ class RendererMixin:
     def draw_background(self) -> None:
         width, height = self.screen.get_size()
         size = (width, height)
-        if self.background_scaled is None or size != self.background_size:
-            source_width, source_height = self.background_source.get_size()
+        render = self.render
+        if render.background_scaled is None or size != render.background_size:
+            source_width, source_height = render.background_source.get_size()
             scale = max(width / source_width, height / source_height)
             scaled_size = (round(source_width * scale), round(source_height * scale))
-            self.background_scaled = pygame.transform.smoothscale(self.background_source, scaled_size)
-            self.background_size = size
-        self.screen.fill(BLACK)
-        image_rect = self.background_scaled.get_rect(center=(width // 2, height // 2))
-        self.screen.blit(self.background_scaled, image_rect)
-        # Sink the image slightly into the background so it supports, rather
-        # than competes with, the editor's neon text and error markers.
-        shade = pygame.Surface(size, pygame.SRCALPHA)
-        shade.fill((0, 5, 12, 88))
-        self.screen.blit(shade, (0, 0))
-        self.draw_ambient_glow(size)
+            render.background_scaled = pygame.transform.smoothscale(render.background_source, scaled_size)
+            render.background_size = size
+            render.background_layer = None
+        if render.background_layer is None:
+            # The city, shade, and bloom are static until resize.  Compose
+            # them once, then each frame only needs one background blit.
+            layer = pygame.Surface(size).convert()
+            layer.fill(BLACK)
+            image_rect = render.background_scaled.get_rect(center=(width // 2, height // 2))
+            layer.blit(render.background_scaled, image_rect)
+            shade = pygame.Surface(size, pygame.SRCALPHA)
+            shade.fill((0, 5, 12, 88))
+            layer.blit(shade, (0, 0))
+            self.ambient_glow_surface(size)
+            layer.blit(render.ambient_glow, (0, 0))
+            render.background_layer = layer
+        self.screen.blit(render.background_layer, (0, 0))
 
     def draw_ambient_glow(self, size: tuple[int, int]) -> None:
         """Place a muted violet bloom behind the centre of the workspace."""
-        if self.ambient_glow is None or size != self.ambient_glow_size:
+        self.ambient_glow_surface(size)
+        self.screen.blit(self.render.ambient_glow, (0, 0))
+
+    def ambient_glow_surface(self, size: tuple[int, int]) -> None:
+        """Build the static ambient glow only when the window size changes."""
+        render = self.render
+        if render.ambient_glow is None or size != render.ambient_glow_size:
             width, height = size
             # This is built once on startup or resize, at quarter resolution,
             # then smoothly scaled. It is a radial alpha overlay, not a
@@ -122,24 +156,24 @@ class RendererMixin:
                     if distance < 1:
                         alpha = round(166 * (1 - distance) ** 1.35)
                         low_glow.set_at((x, y), (112, 76, 139, alpha))
-            self.ambient_glow = pygame.transform.smoothscale(low_glow, size)
-            self.ambient_glow_size = size
-        self.screen.blit(self.ambient_glow, (0, 0))
+            render.ambient_glow = pygame.transform.smoothscale(low_glow, size)
+            render.ambient_glow_size = size
 
     def draw_crt_overlay(self) -> None:
         """Lay a deliberately subtle scanline/noise texture over the frame."""
         size = self.screen.get_size()
-        if self.crt_overlay is None or size != self.overlay_size:
-            self.overlay_size = size
-            self.crt_overlay = pygame.Surface(size, pygame.SRCALPHA)
+        render = self.render
+        if render.crt_overlay is None or size != render.overlay_size:
+            render.overlay_size = size
+            render.crt_overlay = pygame.Surface(size, pygame.SRCALPHA)
             for y in range(1, size[1], 3):
-                pygame.draw.line(self.crt_overlay, (0, 0, 0, 16), (0, y), (size[0], y))
+                pygame.draw.line(render.crt_overlay, (0, 0, 0, 16), (0, y), (size[0], y))
             noise = random.Random(781)
             for _ in range((size[0] * size[1]) // 450):
                 x, y = noise.randrange(size[0]), noise.randrange(size[1])
                 shade = noise.choice(((110, 28, 68, 12), (15, 90, 100, 10), (0, 0, 0, 16)))
-                self.crt_overlay.set_at((x, y), shade)
-        self.screen.blit(self.crt_overlay, (0, 0))
+                render.crt_overlay.set_at((x, y), shade)
+        self.screen.blit(render.crt_overlay, (0, 0))
 
     def project_rows(self, rect: pygame.Rect, pane: Any) -> list[tuple[Path, int, pygame.Rect]]:
         """Compatibility route to a project's pane-owned row geometry."""
@@ -167,7 +201,7 @@ class RendererMixin:
             return
 
         try:
-            target = self.find_pane(self.root_pane, self.last_code_pane_id)
+            target = self.find_pane(self.root_pane, self.runtime.last_code_pane_id)
         except KeyError:
             target = None
         if target is None or target.kind != "code" or target.editor is None:
@@ -178,11 +212,16 @@ class RendererMixin:
         if target is None:
             # A project-only workspace is still useful: opening a source file
             # grows a fresh code pane beside the tree instead of replacing it.
-            self.split_active_pane("vertical")
+            self.runtime.workspace.split_active_pane("vertical")
+            self.status = "VERTICAL SPLIT OPEN"
             target = self.find_pane(self.root_pane, self.active_pane)
-            self.choose_pane_kind(target, "code")
+            self.runtime.workspace.choose_pane_kind(target.pane_id, "code")
+            self.focus = "editor"
+            self.status = "CODE PANE OPEN"
         editor = target.editor
         editor.lines = content.splitlines() or [""]
+        editor.invalidate_render(0, structural=True)
+        editor.invalidate_view_cache()
         editor.row = editor.col = editor.scroll = editor.target_scroll = 0
         editor.dirty = False
         editor.clear_selection()
@@ -191,7 +230,7 @@ class RendererMixin:
         editor.diagnostics = []
         editor.lint_pending = True
         self.active_pane = target.pane_id
-        self.last_code_pane_id = target.pane_id
+        self.runtime.last_code_pane_id = target.pane_id
         self.focus = "editor"
         self.status = f"OPENED {path.name.upper()} IN {target.pane_id.upper()}"
 
@@ -221,12 +260,21 @@ class RendererMixin:
         return editor.diagnostics
 
     def refresh_linting(self, leaves: list[tuple[Any, pygame.Rect]]) -> None:
-        """Debounce lint work so it runs one second after dirty edits settle."""
+        """Debounce background lint work and apply only matching revisions."""
+        for job, diagnostics in self.lint_scheduler.drain():
+            for pane, _ in leaves:
+                editor = pane.editor
+                if editor is None or str(editor.path.resolve()) != str(job.path.resolve()):
+                    continue
+                if "\n".join(editor.lines) != job.source:
+                    continue
+                editor.diagnostics = diagnostics
+                editor.lint_pending = False
         now = pygame.time.get_ticks()
         if now - self.last_lint_tick < int(self.settings["lint_interval_ms"]):
             return
         self.last_lint_tick = now
-        cached_results: dict[tuple[str, str], list[Diagnostic]] = {}
+        queued: set[tuple[str, str]] = set()
         for pane, _ in leaves:
             editor = pane.editor
             if editor is None:
@@ -235,10 +283,14 @@ class RendererMixin:
                 continue
             source = "\n".join(editor.lines)
             key = (str(editor.path.resolve()), source)
-            if key not in cached_results:
-                cached_results[key] = self.linter.lint(source, editor.path) if editor.path.suffix.lower() == ".py" else []
-            editor.diagnostics = cached_results[key]
-            editor.lint_pending = False
+            if key in queued:
+                continue
+            queued.add(key)
+            if editor.path.suffix.lower() == ".py":
+                self.lint_scheduler.submit(source, editor.path)
+            else:
+                editor.diagnostics = []
+                editor.lint_pending = False
 
     @staticmethod
     def diagnostic_color(diagnostic: Diagnostic) -> tuple[int, int, int]:
@@ -248,7 +300,7 @@ class RendererMixin:
         """Underline a diagnostic's exact source span with a compact pixel wave."""
         start = max(0, min(len(line), diagnostic.start_column))
         end = max(start + 1, min(len(line), diagnostic.end_column))
-        content = self.editor_content_rect(rect)
+        content = EditorPane.editor_content_rect(rect)
         left = content.x + self.measure_text(line[:start], editor=True) - horizontal_scroll
         right = min(content.x + self.measure_text(line[:end], editor=True) - horizontal_scroll, content.right)
         if right - left < 2:
@@ -265,7 +317,7 @@ class RendererMixin:
         """Draw visible-line pips that travel with code while it scrolls."""
         priority = {"suggestion": 0, "warning": 1, "error": 2}
         for diagnostic in sorted(diagnostics, key=lambda item: priority.get(item.severity, 2)):
-            if not editor.scroll <= diagnostic.line < editor.scroll + self.visible_editor_lines(rect):
+            if not editor.scroll <= diagnostic.line < editor.scroll + EditorPane.visible_editor_lines(rect):
                 continue
             line_y = rect.y + 44 + (diagnostic.line - editor.scroll) * LINE_HEIGHT
             pygame.draw.rect(
@@ -283,12 +335,12 @@ class RendererMixin:
             # the next analysis replaces an older result set.
             if not 0 <= diagnostic.line < len(editor.lines):
                 continue
-            if not editor.scroll <= diagnostic.line < editor.scroll + self.visible_editor_lines(rect):
+            if not editor.scroll <= diagnostic.line < editor.scroll + EditorPane.visible_editor_lines(rect):
                 continue
             line = editor.lines[diagnostic.line]
             start = max(0, min(len(line), diagnostic.start_column))
             end = max(start + 1, min(len(line), diagnostic.end_column))
-            content = self.editor_content_rect(rect)
+            content = EditorPane.editor_content_rect(rect)
             left = content.x + self.measure_text(line[:start], editor=True) - editor.horizontal_scroll
             right = max(left + 8, content.x + self.measure_text(line[:end], editor=True) - editor.horizontal_scroll)
             line_y = rect.y + 44 + (diagnostic.line - editor.scroll) * LINE_HEIGHT
@@ -357,7 +409,12 @@ class RendererMixin:
 
     def function_at_pointer(self, rect: pygame.Rect, editor: Editor, position: tuple[int, int]) -> FunctionInfo | None:
         """Resolve a local function from the identifier currently under the mouse."""
-        content = self.editor_content_rect(rect)
+        # Parsing a large source document while a user is mid-keystroke makes
+        # typing feel sticky. Tooltips can comfortably wait for the editor to
+        # settle, then resolve once against the final revision.
+        if monotonic() - editor.source_changed_at < 0.3:
+            return None
+        content = EditorPane.editor_content_rect(rect)
         if not content.collidepoint(position):
             return None
         rows = editor.visible_rows()
@@ -371,7 +428,18 @@ class RendererMixin:
             if relative_x < self.measure_text(editor.lines[line][:index + 1], editor=True):
                 column = index
                 break
-        return function_at(editor.lines, line, column, self.symbol_cache.lookup_imported_function)
+        indexes = getattr(self, "_function_indexes", None)
+        if indexes is None:
+            indexes = {}
+            self._function_indexes = indexes
+        index = indexes.setdefault(id(editor), FunctionIndex())
+        return index.resolve(
+            editor.lines,
+            line,
+            column,
+            editor.source_revision,
+            lambda symbol, tree: self.symbol_cache.lookup_imported_function(editor.lines, symbol, tree),
+        )
 
     def draw_function_tooltip(self) -> None:
         """Draw source-backed signature and docstring details when no lint card wins."""
@@ -433,7 +501,7 @@ class RendererMixin:
         self.text(self.screen, "UNDERTOW:/PYTHON", (PADDING, 17), INK, True)
         for index, color in enumerate(self.scanner_pip_colors(pygame.time.get_ticks(), self.symbol_scanner.is_busy)):
             pygame.draw.rect(self.screen, color, (width - 310 + index * 16, 43, 11, 8))
-        self.window_controls.draw(self.gui, self.screen, width)
+        self.window_state.controls.draw(self.gui, self.screen, width)
 
     @staticmethod
     def scanner_pip_colors(now_ms: int, busy: bool, count: int = 9) -> list[tuple[int, int, int]]:
@@ -444,32 +512,8 @@ class RendererMixin:
         return [INK if index == active else CYAN_DARK for index in range(count)]
 
     def context_actions(self, target: str) -> list[tuple[str, str]]:
-        """Return only actions that make sense for the clicked pane type."""
-        try:
-            pane = self.find_pane(self.root_pane, target)
-        except KeyError:
-            return []
-        actions = [("vsplit", "VSPLIT PANE"), ("hsplit", "HSPLIT PANE"), ("reset", "RESET PANE"), ("kill", "KILL PANE")]
-        if pane.kind == "code":
-            return [("save", "SAVE FILE"), ("fold_all", "FOLD ALL"), ("unfold_all", "UNFOLD ALL"), *actions]
-        if pane.kind == "output":
-            return [("clear_output", "CLEAR OUTPUT"), *actions]
-        if pane.kind == "project":
-            project_actions = [("open_project", "OPEN / CREATE PROJECT")]
-            if self.context_project_entry is not None:
-                project_actions.append(("explore", "EXPLORE HERE"))
-            return [*project_actions, *actions]
-        if pane.kind == "structure":
-            state = pane.view
-            if not isinstance(state, StructurePane):
-                return actions
-            return [
-                ("toggle_private", "HIDE PRIVATE" if state.show_private else "SHOW PRIVATE"),
-                ("toggle_methods", "HIDE METHODS" if state.show_methods else "SHOW METHODS"),
-                ("toggle_structure_variables", "HIDE VARIABLES" if state.show_variables else "SHOW VARIABLES"),
-                *actions,
-            ]
-        return actions
+        """Expose pane-registered actions to rendering as name/label pairs."""
+        return [(action.name, action.label) for action in self.context_controller.actions_for(self, target)]
 
     def draw_context(self) -> None:
         if not self.context_menu:

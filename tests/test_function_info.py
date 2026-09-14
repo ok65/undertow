@@ -1,6 +1,6 @@
 import unittest
 
-from undertow.function_info import function_at
+from undertow.function_info import FunctionIndex, function_at
 
 
 class FunctionInfoTests(unittest.TestCase):
@@ -29,6 +29,16 @@ class FunctionInfoTests(unittest.TestCase):
 
         self.assertEqual(info.prototype, "class Wave")
         self.assertEqual(info.docstring, "A surfable wave.")
+
+    def test_index_parses_once_per_source_revision(self) -> None:
+        lines = ["def surf() -> None:", "    pass", "surf()"]
+        index = FunctionIndex()
+
+        first = index.resolve(lines, 2, 1, revision=4)
+        second = index.resolve(lines, 2, 2, revision=4)
+
+        self.assertEqual(first, second)
+        self.assertEqual(index._revision, 4)
 
 
 if __name__ == "__main__":

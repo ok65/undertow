@@ -12,6 +12,7 @@ from undertow.function_info import function_at
 from undertow.gui_elements import TreeScroll
 from undertow.theme import CYAN, DIM, INK
 from undertow.workspace import Pane
+from undertow.context_actions import ContextAction
 
 
 @dataclass(frozen=True)
@@ -40,9 +41,9 @@ class StructurePane(Pane):
 
     def draw(self, renderer: Any, rect: pygame.Rect) -> None:
         """Draw symbols for this pane's associated code buffer."""
-        rows, editor = renderer.structure_rows(self)
+        rows, editor = self.rows_for(renderer)
         renderer.panel(rect, renderer.structure_title(editor), renderer.active_pane == self.pane_id)
-        viewport = renderer.structure_tree_viewport(self, rect, len(rows))
+        viewport = self.tree_viewport(renderer, rect, len(rows))
         if not rows:
             renderer.text(renderer.screen, "NO STRUCTURE IN ACTIVE BUFFER", (rect.x + 12, rect.y + 44), DIM)
             return
@@ -63,7 +64,7 @@ class StructurePane(Pane):
         """Resolve the declaration under the pointer for the shared tooltip."""
         if editor is None or not rect.collidepoint(position):
             return None
-        viewport = renderer.structure_tree_viewport(self, rect, len(rows))
+        viewport = self.tree_viewport(renderer, rect, len(rows))
         index = viewport.item_index_at(position)
         if index is None:
             return None
@@ -72,6 +73,57 @@ class StructurePane(Pane):
             return None
         source = editor.lines[item.line]
         return function_at(editor.lines, item.line, source.find(item.name), renderer.symbol_cache.lookup_imported_function)
+
+    def source_editor(self, renderer: Any) -> Any | None:
+        """Resolve the code pane this structure view follows."""
+        source_id = self.source_pane_id or renderer.runtime.last_code_pane_id
+        try:
+            source = renderer.runtime.workspace.find(source_id)
+        except KeyError:
+            source = None
+        return source.editor if source is not None and source.kind == "code" else renderer.services.debugging.debug_editor()
+
+    def rows_for(self, renderer: Any) -> tuple[list[StructureRow], Any | None]:
+        editor = self.source_editor(renderer)
+        if editor is None:
+            return [], None
+        return self.rows(editor.lines, self.show_private, self.show_methods, self.show_variables), editor
+
+    def tree_viewport(self, renderer: Any, rect: pygame.Rect, item_count: int):
+        bounds = pygame.Rect(rect.x + 10, rect.y + 42, rect.w - 20, rect.h - 52)
+        return renderer.gui.tree_viewport(bounds, item_count, self.tree_scroll.scroll, 25)
+
+    def scroll(self, renderer: Any, rect: pygame.Rect, amount: int) -> None:
+        rows, _ = self.rows_for(renderer)
+        self.tree_scroll.scroll_by(amount, self.tree_viewport(renderer, rect, len(rows)).maximum_scroll)
+
+    def handle_click(self, renderer: Any, rect: pygame.Rect, position: tuple[int, int]) -> bool:
+        """Focus the source pane at the selected declaration."""
+        rows, editor = self.rows_for(renderer)
+        if editor is None:
+            return False
+        index = self.tree_viewport(renderer, rect, len(rows)).item_index_at(position)
+        if index is None:
+            return False
+        editor.row, editor.col = rows[index].line, 0
+        editor.clear_selection()
+        source_id = self.source_pane_id or renderer.runtime.last_code_pane_id
+        try:
+            target = renderer.runtime.workspace.find(source_id)
+        except KeyError:
+            return False
+        renderer.active_pane, renderer.focus = target.pane_id, "editor"
+        pane_rect = renderer.layout_state.pane_rects.get(target.pane_id)
+        if pane_rect is not None and hasattr(target.view, "ensure_caret_visible"):
+            target.view.ensure_caret_visible(renderer, pane_rect)
+        return True
+
+    def pane_context_actions(self, app: Any, pane: Any = None) -> list[ContextAction]:
+        return [
+            ContextAction("toggle_private", "HIDE PRIVATE" if self.show_private else "SHOW PRIVATE", lambda _owner, target: setattr(target.view, "show_private", not target.view.show_private)),
+            ContextAction("toggle_methods", "HIDE METHODS" if self.show_methods else "SHOW METHODS", lambda _owner, target: setattr(target.view, "show_methods", not target.view.show_methods)),
+            ContextAction("toggle_structure_variables", "HIDE VARIABLES" if self.show_variables else "SHOW VARIABLES", lambda _owner, target: setattr(target.view, "show_variables", not target.view.show_variables)),
+        ]
 
     @staticmethod
     def rows(lines: list[str], show_private: bool, show_methods: bool, show_variables: bool) -> list[StructureRow]:

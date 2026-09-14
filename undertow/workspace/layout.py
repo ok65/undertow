@@ -74,10 +74,38 @@ class Pane:
         """
         return None
 
-    def draw(self, context: Any = None, rect: Any = None) -> None:
-        """Draw this pane into ``rect``.
+    def fetch_context_actions(self, app: Any) -> list[Any]:
+        """Return common actions followed by the concrete view's additions."""
+        from undertow.context_actions import ContextAction
 
-        Concrete pane types override this hook; split/layout nodes are not
-        drawable leaves and therefore have nothing to do here.
+        defaults = [
+            ContextAction("vsplit", "VSPLIT PANE", lambda owner, pane: owner._context_split(pane, "vertical")),
+            ContextAction("hsplit", "HSPLIT PANE", lambda owner, pane: owner._context_split(pane, "horizontal")),
+            ContextAction("reset", "RESET PANE", lambda owner, pane: owner._context_reset(pane)),
+            ContextAction("kill", "KILL PANE", lambda owner, pane: owner._context_kill(pane)),
+        ]
+        provider = getattr(self.view, "pane_context_actions", None)
+        extras = list(provider(app, self) if callable(provider) else ())
+        # Lightweight layout nodes used by callers/tests may not have a
+        # concrete view attached yet; retain the pane-kind contract there too.
+        if not extras and self.kind == "project":
+            extras.append(ContextAction("open_project", "OPEN / CREATE PROJECT", lambda owner, _pane: owner.show_project_modal()))
+            if owner_entry := getattr(app, "context_project_entry", None):
+                extras.append(ContextAction("explore", "EXPLORE HERE", lambda owner, _pane: owner.explore_project_entry(owner_entry)))
+        return [*extras, *defaults]
+
+    def pane_context_actions(self, app: Any, pane: Any = None) -> list[Any]:
+        """Optional pane-specific additions; common actions stay in the base."""
+        return []
+
+    def draw(self, context: Any = None, rect: Any = None) -> None:
+        """Draw this leaf by delegating to its own concrete view.
+
+        The workspace loop only knows that it has a leaf.  Pane kind checks
+        belong in construction and event routing, never in the render loop.
+        A chooser is the sole no-view leaf and draws its own fallback here.
         """
-        return None
+        if self.view is not None and self.view is not self:
+            self.view.draw(context, rect)
+        elif context is not None and rect is not None and self.is_leaf:
+            context.draw_empty_pane(rect)

@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
+from typing import Callable
 
 from .linting import Diagnostic
 from .three_way_merge import merge_lines
@@ -46,8 +48,16 @@ class Editor(Pane):
     disk_revision: tuple[int, int] | None = field(default=None, init=False, repr=False)
     disk_lines: list[str] = field(default_factory=list, init=False, repr=False)
     external_change_pending: bool = field(default=False, init=False)
+    render_dirty_from: int | None = field(default=0, init=False, repr=False)
+    render_dirty_to: int | None = field(default=None, init=False, repr=False)
+    render_structure_dirty: bool = field(default=True, init=False, repr=False)
+    source_revision: int = field(default=0, init=False, repr=False)
+    source_changed_at: float = field(default_factory=monotonic, init=False, repr=False)
     _last_edit_kind: str | None = field(default=None, init=False, repr=False)
     _last_edit_at: float = field(default=0, init=False, repr=False)
+    _foldable_ranges_cache: dict[int, int] | None = field(default=None, init=False, repr=False)
+    _visible_rows_cache: list[int] | None = field(default=None, init=False, repr=False)
+    _maximum_line_width: int | None = field(default=None, init=False, repr=False)
 
     def _state(self) -> EditorState:
         return EditorState(tuple(self.lines), self.row, self.col, self.selection_anchor, self.dirty)
@@ -58,6 +68,9 @@ class Editor(Pane):
         self.selection_anchor = state.selection_anchor
         self.dirty = state.dirty
         self.lint_pending = True
+        self.invalidate_render(0, structural=True)
+        self.invalidate_view_cache()
+        self._maximum_line_width = None
 
     def begin_edit(self, kind: str, coalesce: bool = False) -> None:
         """Checkpoint before a mutation, grouping only uninterrupted edits."""
@@ -89,9 +102,42 @@ class Editor(Pane):
         self.break_undo_chunk()
         return True
 
-    def mark_dirty(self) -> None:
+    def mark_dirty(self, start_row: int | None = None, end_row: int | None = None, structural: bool = False) -> None:
         self.dirty = True
         self.lint_pending = True
+        self.invalidate_render(self.row if start_row is None else start_row, end_row, structural)
+        self.invalidate_view_cache()
+        self._maximum_line_width = None
+
+    def invalidate_render(self, start_row: int = 0, end_row: int | None = None, structural: bool = False) -> None:
+        """Mark cached static text stale without changing document dirtiness."""
+        self.source_revision += 1
+        self.source_changed_at = monotonic()
+        start = max(0, start_row)
+        end = start if end_row is None else max(start, end_row)
+        self.render_dirty_from = start if self.render_dirty_from is None else min(self.render_dirty_from, start)
+        self.render_dirty_to = end if self.render_dirty_to is None else max(self.render_dirty_to, end)
+        self.render_structure_dirty = self.render_structure_dirty or structural
+        if structural:
+            self._maximum_line_width = None
+
+    def invalidate_view_cache(self) -> None:
+        """Discard derived folding rows after source or fold state changes."""
+        self._foldable_ranges_cache = None
+        self._visible_rows_cache = None
+
+    def maximum_line_width(self, measure_text: Callable[[str], int]) -> int:
+        """Cache the widest rendered source row until the document changes."""
+        if self._maximum_line_width is None:
+            self._maximum_line_width = max((measure_text(line) for line in self.lines), default=0)
+        return self._maximum_line_width
+
+    def consume_render_dirty(self) -> tuple[int | None, int | None, bool]:
+        """Return and clear the minimal static-text region needing redraw."""
+        dirty = self.render_dirty_from, self.render_dirty_to, self.render_structure_dirty
+        self.render_dirty_from = self.render_dirty_to = None
+        self.render_structure_dirty = False
+        return dirty
 
     def current_disk_revision(self) -> tuple[int, int] | None:
         """Return a cheap version marker for the backing file, if it exists."""
@@ -126,6 +172,9 @@ class Editor(Pane):
         self.break_undo_chunk()
         self.dirty = False
         self.lint_pending = True
+        self.render_dirty_from, self.render_dirty_to, self.render_structure_dirty = 0, None, True
+        self.invalidate_view_cache()
+        self._maximum_line_width = None
         self.record_disk_revision()
         return True
 
@@ -141,6 +190,9 @@ class Editor(Pane):
         self.lines[:] = merged
         self.dirty = self.lines != external_lines
         self.lint_pending = True
+        self.render_dirty_from, self.render_dirty_to, self.render_structure_dirty = 0, None, True
+        self.invalidate_view_cache()
+        self._maximum_line_width = None
         self.record_disk_revision(external_lines)
         return True
 
@@ -175,10 +227,11 @@ class Editor(Pane):
         self.lines[start_row:end_row + 1] = [self.lines[start_row][:start_col] + self.lines[end_row][end_col:]]
         self.row, self.col = start_row, start_col
         self.clear_selection()
-        self.mark_dirty()
+        self.mark_dirty(start_row, end_row, structural=start_row != end_row)
         return True
 
     def insert(self, text: str, coalesce: bool = False, kind: str = "typing") -> None:
+        start_row = self.row
         self.begin_edit(kind, coalesce and self.selection_bounds() is None and "\n" not in text)
         self.delete_selection()
         line = self.current()
@@ -192,7 +245,7 @@ class Editor(Pane):
             self.lines[self.row:self.row + 1] = replacement
             self.row += len(replacement) - 1
             self.col = len(pieces[-1])
-        self.mark_dirty()
+        self.mark_dirty(start_row, self.row, structural=len(pieces) > 1)
 
     def insert_typed(self, text: str) -> None:
         """Insert committed text with predictable bracket and quote pairing."""
@@ -245,9 +298,10 @@ class Editor(Pane):
         self.lines.insert(self.row + 2, indent + '"""')
         self.row += 1
         self.col = len(indent)
-        self.mark_dirty()
+        self.mark_dirty(self.row - 1, self.row + 1, structural=True)
 
     def newline(self) -> None:
+        start_row = self.row
         self.begin_edit("newline")
         self.delete_selection()
         line = self.current()
@@ -266,7 +320,7 @@ class Editor(Pane):
             self.lines.insert(self.row + 1, indent + after)
         self.row += 1
         self.col = len(inner_indent) if pair in {"()", "[]", "{}"} else len(indent)
-        self.mark_dirty()
+        self.mark_dirty(start_row, self.row + 1, structural=True)
 
     def matching_bracket_at(self) -> tuple[tuple[int, int], tuple[int, int]] | None:
         """Return the adjacent bracket pair anywhere in the buffer, if matched."""
@@ -304,40 +358,73 @@ class Editor(Pane):
         return None
 
     def foldable_ranges(self) -> dict[int, int]:
+        if self._foldable_ranges_cache is not None:
+            return self._foldable_ranges_cache
         ranges: dict[int, int] = {}
-        for start, line in enumerate(self.lines[:-1]):
-            if not line.rstrip().endswith(":"):
-                continue
-            indent = len(line) - len(line.lstrip(" "))
-            end = start + 1
-            for index in range(start + 1, len(self.lines)):
-                candidate = self.lines[index]
-                if candidate.strip() and len(candidate) - len(candidate.lstrip(" ")) <= indent:
-                    break
-                end = index
-            if end > start + 1:
-                ranges[start] = end
+        try:
+            tree = ast.parse("\n".join(self.lines))
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            for node in ast.walk(tree):
+                if not isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                start = node.lineno - 1
+                end = (getattr(node, "end_lineno", node.lineno) or node.lineno) - 1
+                # Keep immediately trailing blank lines with the declaration,
+                # matching the way a code editor folds a complete block.
+                indent = len(self.lines[start]) - len(self.lines[start].lstrip(" "))
+                while end + 1 < len(self.lines) and (
+                    not self.lines[end + 1].strip()
+                    or len(self.lines[end + 1]) - len(self.lines[end + 1].lstrip(" ")) > indent
+                ):
+                    end += 1
+                if end > start:
+                    ranges[start] = end
+        else:
+            # During an incomplete edit, retain structural folding without
+            # accidentally treating if/for/while/try blocks as declarations.
+            for start, line in enumerate(self.lines[:-1]):
+                stripped = line.lstrip(" ")
+                if not (stripped.startswith(("class ", "def ", "async def "))) or not line.rstrip().endswith(":"):
+                    continue
+                indent = len(line) - len(stripped)
+                end = start + 1
+                for index in range(start + 1, len(self.lines)):
+                    candidate = self.lines[index]
+                    if candidate.strip() and len(candidate) - len(candidate.lstrip(" ")) <= indent:
+                        break
+                    end = index
+                if end > start + 1:
+                    ranges[start] = end
+        self._foldable_ranges_cache = ranges
         return ranges
 
     def visible_rows(self) -> list[int]:
+        if self._visible_rows_cache is not None:
+            return self._visible_rows_cache
         ranges = self.foldable_ranges()
         hidden = {row for start in self.folded_starts for row in range(start + 1, ranges.get(start, start) + 1)}
         self.folded_starts.intersection_update(ranges)
-        return [row for row in range(len(self.lines)) if row not in hidden]
+        self._visible_rows_cache = [row for row in range(len(self.lines)) if row not in hidden]
+        return self._visible_rows_cache
 
     def toggle_fold(self, row: int) -> bool:
         if row not in self.foldable_ranges():
             return False
         if row in self.folded_starts: self.folded_starts.remove(row)
         else: self.folded_starts.add(row)
+        self._visible_rows_cache = None
         return True
 
     def fold_all(self) -> None:
         ranges = self.foldable_ranges()
         self.folded_starts = {start for start in ranges if not self.lines[start].startswith(" ")}
+        self._visible_rows_cache = None
 
     def unfold_all(self) -> None:
         self.folded_starts.clear()
+        self._visible_rows_cache = None
 
     def backspace(self) -> None:
         if self.selection_bounds() is not None:
@@ -347,6 +434,7 @@ class Editor(Pane):
         if not self.col and not self.row:
             return
         self.begin_edit("backspace", coalesce=True)
+        joined_lines = not self.col
         if self.col:
             line = self.current()
             width = 4 if self.col >= 4 and line[self.col - 4:self.col] == "    " else 1
@@ -360,7 +448,7 @@ class Editor(Pane):
             self.row -= 1
         else:
             return
-        self.mark_dirty()
+        self.mark_dirty(self.row, structural=joined_lines)
 
     def delete(self) -> None:
         if self.selection_bounds() is not None:
@@ -377,7 +465,7 @@ class Editor(Pane):
             self.lines[self.row] += self.lines.pop(self.row + 1)
         else:
             return
-        self.mark_dirty()
+        self.mark_dirty(self.row, structural=self.col == len(line))
 
     def _prepare_selection(self, extend_selection: bool) -> None:
         if extend_selection:
@@ -457,7 +545,7 @@ class Editor(Pane):
         for index, delta in changes.items():
             self.lines[index] = (" " * delta + self.lines[index]) if delta > 0 else self.lines[index][-delta:]
         self._shift_positions(changes)
-        self.mark_dirty()
+        self.mark_dirty(first, last)
         return True
 
     def toggle_comment(self) -> bool:
@@ -481,7 +569,7 @@ class Editor(Pane):
                 self.lines[index] = self.lines[index][:start] + "# " + self.lines[index][start:]
                 changes[index] = 2
         self._shift_positions(changes, starts)
-        self.mark_dirty()
+        self.mark_dirty(first, last)
         return True
 
     def _shift_positions(self, changes: dict[int, int], starts: dict[int, int] | None = None) -> None:

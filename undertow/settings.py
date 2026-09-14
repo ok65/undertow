@@ -21,6 +21,7 @@ class UndertowSettings(MutableMapping[str, Any]):
         "symbol_scan_interval_ms": 30_000,
         "project_inspection_interval_ms": 30_000,
         "target_fps": 30,
+        "idle_fps": 10,
     }
     MAX_RECENT_PROJECTS = 10
 

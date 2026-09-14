@@ -6,7 +6,7 @@ from typing import Any
 
 import pygame
 
-from .panes import EditorPane, InspectorPane
+from .panes import EditorPane, InspectorPane, ProjectPane, StructurePane
 
 
 class EventHandler:
@@ -24,6 +24,10 @@ class EventHandler:
     ) -> bool:
         """Handle the current event batch and return whether the app remains open."""
         for event in pygame.event.get():
+            self.app.last_interaction_tick = pygame.time.get_ticks()
+            if event.type == pygame.KEYDOWN and event.key == pygame.K_F12 and event.mod & pygame.KMOD_CTRL and event.mod & pygame.KMOD_SHIFT:
+                self.app.toggle_performance_capture()
+                continue
             consumed, close_requested = self.app.handle_window_chrome_event(event)
             if close_requested:
                 alive = False
@@ -32,7 +36,7 @@ class EventHandler:
                 continue
             if event.type == pygame.QUIT:
                 alive = False
-            elif self.app.project_modal.is_open:
+            elif self.app.runtime.project_modal.is_open:
                 self._project_modal_event(event)
             elif event.type == pygame.KEYDOWN and self.app.focus == "search":
                 self.app.search_key(event)
@@ -52,7 +56,7 @@ class EventHandler:
                     self.app.focus = "search"
                     continue
                 self.app.handle_key(event, pane)
-                self.app.ensure_caret_visible(pane.editor, self.app.pane_rects[self.app.active_pane])
+                pane.ensure_caret_visible(self.app, self.app.layout_state.pane_rects[self.app.active_pane])
             elif event.type == pygame.TEXTINPUT and self.app.focus == "editor":
                 editor = self.app.active_editor()
                 if editor is None:
@@ -79,7 +83,7 @@ class EventHandler:
 
     def _project_modal_event(self, event: pygame.event.Event) -> None:
         """Keep the startup project gate modal until a project is selected."""
-        self.app.project_modal.handle_event(event, self.app.open_project_folder)
+        self.app.runtime.project_modal.handle_event(event, self.app.open_project_folder)
 
     def _wheel(
         self, position: tuple[int, int], leaves: list[tuple[Any, pygame.Rect]], output_rect: pygame.Rect, delta: int, horizontal_delta: int = 0,
@@ -94,13 +98,15 @@ class EventHandler:
         if horizontal_delta and self.app.scroll_editor_under_pointer(position, leaves, 0, horizontal_delta):
             return
         if project is not None:
-            self.app.scroll_project_tree(project[0], project[1], -delta * 3)
+            if isinstance(project[0].view, ProjectPane):
+                project[0].view.scroll(self.app.gui, project[1], -delta * 3)
         elif output is not None:
             self.app.focus = "output"
             self.app.active_pane = output[0].pane_id
             self.app.scroll_output(output[0], output[1], delta)
         elif structure is not None:
-            self.app.scroll_structure(structure[0], structure[1], -delta * 3)
+            if isinstance(structure[0].view, StructurePane):
+                structure[0].view.scroll(self.app, structure[1], -delta * 3)
         elif inspector is not None:
             if isinstance(inspector[0].view, InspectorPane):
                 inspector[0].view.scroll(self.app, inspector[1], -delta * 3)
@@ -132,17 +138,24 @@ class EventHandler:
             self.app.context_action(event.pos)
             return
         self.app.context_menu = None
-        divider = next(((pane, parent) for pane, rect, parent in self.app.dividers if rect.collidepoint(event.pos)), None)
+        divider = self.app.layout_state.divider_at(event.pos)
         clicked = next(((pane, rect) for pane, rect in leaves if rect.collidepoint(event.pos)), None)
         if divider:
-            self.app.dragging_divider = divider
+            self.app.layout_state.dragging_divider = divider
         elif clicked:
             pane, rect = clicked
             self.app.active_pane = pane.pane_id
             if pane.kind == "empty":
                 choice = next((kind for kind, _label, bounds in self.app.empty_pane_choices(rect) if bounds.collidepoint(event.pos)), None)
                 if choice is not None:
-                    self.app.choose_pane_kind(pane, choice)
+                    replacement = self.app.runtime.workspace.choose_pane_kind(pane.pane_id, choice)
+                    if replacement is not None:
+                        if choice == "code":
+                            self.app.focus = "editor"
+                        elif choice == "terminal":
+                            self.app.focus = "terminal"
+                            self.app.ensure_terminal(replacement.pane_id)
+                        self.app.status = f"{choice.upper()} PANE OPEN"
                 return
             if pane.kind == "project":
                 self.app.handle_project_click(pane, event.pos, rect, getattr(event, "clicks", 1))
@@ -156,7 +169,8 @@ class EventHandler:
                 return
             if pane.kind == "structure":
                 self.app.focus = "structure"
-                self.app.handle_structure_click(pane, rect, event.pos)
+                if isinstance(pane.view, StructurePane):
+                    pane.view.handle_click(self.app, rect, event.pos)
                 return
             if pane.kind == "inspector":
                 self.app.focus = "inspector"
@@ -173,20 +187,20 @@ class EventHandler:
                 return
             if not isinstance(pane.view, EditorPane):
                 return
-            self.app.last_code_pane_id = pane.pane_id
+            self.app.runtime.last_code_pane_id = pane.pane_id
             if self.app.handle_code_header_click(pane.pane_id, rect, event.pos):
                 self.app.focus = "editor"
                 return
-            if self.app.toggle_fold_at(pane.editor, rect, event.pos):
+            if pane.view.toggle_fold_at(rect, event.pos):
                 self.app.focus = "editor"
                 return
-            if self.app.toggle_breakpoint_at(pane.editor, rect, event.pos):
+            if pane.view.toggle_breakpoint_at(self.app, rect, event.pos):
                 self.app.focus = "editor"
                 return
-            scrollbar = self.app.horizontal_scrollbar(pane.editor, rect)
+            scrollbar = pane.view.horizontal_scrollbar(self.app, rect)
             if scrollbar and scrollbar[0].collidepoint(event.pos):
-                self.app.dragging_horizontal_scroll = (pane.editor, rect)
-                self.app.set_horizontal_scroll_from_pointer(pane.editor, rect, event.pos[0])
+                self.app.layout_state.dragging_horizontal_scroll = (pane.view, rect)
+                pane.view.set_horizontal_scroll_from_pointer(self.app, rect, event.pos[0])
             else:
                 pane.view.place_caret(self.app, event.pos, rect)
                 pane.editor.selection_anchor = (pane.editor.row, pane.editor.col)
@@ -198,21 +212,21 @@ class EventHandler:
         if self.app.drag_selecting:
             pane = self.app.active_editor_pane()
             if pane is not None:
-                pane.place_caret(self.app, event.pos, self.app.pane_rects[self.app.active_pane], extend_selection=True)
-        elif self.app.dragging_horizontal_scroll:
-            editor, rect = self.app.dragging_horizontal_scroll
-            self.app.set_horizontal_scroll_from_pointer(editor, rect, event.pos[0])
-        elif self.app.dragging_divider:
-            pane, parent = self.app.dragging_divider
+                pane.place_caret(self.app, event.pos, self.app.layout_state.pane_rects[self.app.active_pane], extend_selection=True)
+        elif self.app.layout_state.dragging_horizontal_scroll:
+            pane, rect = self.app.layout_state.dragging_horizontal_scroll
+            pane.set_horizontal_scroll_from_pointer(self.app, rect, event.pos[0])
+        elif self.app.layout_state.dragging_divider:
+            pane, parent = self.app.layout_state.dragging_divider
             ratio = (event.pos[0] - parent.x) / parent.w if pane.axis == "vertical" else (event.pos[1] - parent.y) / parent.h
             pane.ratio = max(0.15, min(0.85, ratio))
-            self.app.workspace.mark_dirty()
+            self.app.runtime.workspace.mark_dirty()
 
     def _button_up(self, event: pygame.event.Event) -> None:
         if self.app.drag_selecting:
             pane = self.app.active_editor_pane()
             if pane is not None:
-                pane.place_caret(self.app, event.pos, self.app.pane_rects[self.app.active_pane], extend_selection=True)
+                pane.place_caret(self.app, event.pos, self.app.layout_state.pane_rects[self.app.active_pane], extend_selection=True)
         self.app.drag_selecting = False
-        self.app.dragging_divider = None
-        self.app.dragging_horizontal_scroll = None
+        self.app.layout_state.dragging_divider = None
+        self.app.layout_state.dragging_horizontal_scroll = None

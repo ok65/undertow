@@ -1,10 +1,25 @@
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from undertow.editor import Editor
+from undertow.panes import EditorPane
 
 
 class EditorTests(unittest.TestCase):
+    def test_status_text_counts_code_and_selected_rows(self) -> None:
+        editor = Editor(lines=["# setup", "", "wave = 1", "# cleanup", "surf()"], row=4, col=2, selection_anchor=(2, 0))
+
+        self.assertEqual(EditorPane("pane-1", editor).status_text(), "SEL: 3 LINES  //  ROWS: 5  //  CODE: 2")
+
+    def test_status_text_throttles_the_full_document_count(self) -> None:
+        pane = EditorPane("pane-1", Editor(lines=["wave = 1"]))
+        with mock.patch("undertow.panes.editor.monotonic", side_effect=(1.0, 1.2, 2.6)):
+            self.assertIn("ROWS: 1", pane.status_text())
+            pane.editor.lines.append("surf()")
+            self.assertIn("ROWS: 1", pane.status_text())
+            self.assertIn("ROWS: 2", pane.status_text())
+
     def test_multiline_insert_replaces_selection_and_updates_cursor(self) -> None:
         editor = Editor(
             lines=["alpha", "bravo", "charlie"],
@@ -131,6 +146,16 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(editor.visible_rows(), [0, 4])
         editor.unfold_all()
         self.assertEqual(editor.visible_rows(), [0, 1, 2, 3, 4])
+
+    def test_folding_only_targets_classes_and_functions(self) -> None:
+        editor = Editor(lines=[
+            "if ready:", "    value = 1", "", "class Board:",
+            "    def reset(self):", "        return None", "", "while True:", "    break",
+        ])
+        self.assertNotIn(0, editor.foldable_ranges())
+        self.assertIn(3, editor.foldable_ranges())
+        self.assertIn(4, editor.foldable_ranges())
+        self.assertNotIn(7, editor.foldable_ranges())
 
     def test_shift_movement_keeps_an_anchor_and_extends_selection(self) -> None:
         editor = Editor(lines=["abcdef"], row=0, col=2)

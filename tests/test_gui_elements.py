@@ -5,10 +5,35 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import pygame
 
-from undertow.gui_elements import GUIElements, TreeScroll
+from undertow.gui_elements import GUIElements, LargeTextBuffer, TreeScroll
 
 
 class GUIElementsTests(unittest.TestCase):
+    def test_large_text_buffer_redraws_only_the_dirty_chunk(self) -> None:
+        pygame.init()
+        try:
+            target = pygame.Surface((120, 60), pygame.SRCALPHA)
+            buffer = LargeTextBuffer(chunk_rows=2)
+            rendered: list[int] = []
+
+            def draw_line(surface: pygame.Surface, source_row: int, y: int) -> None:
+                rendered.append(source_row)
+                pygame.draw.line(surface, (255, 255, 255), (0, y), (30, y))
+
+            rows = [0, 1, 2, 3]
+            buffer.prepare(rows, 120, 10, (4, ()), dirty_from=0, structural_change=True)
+            buffer.draw(target, pygame.Rect(0, 0, 120, 20), 0, 0, draw_line)
+            self.assertEqual(rendered, [0, 1])
+
+            buffer.draw(target, pygame.Rect(0, 0, 120, 20), 0, 0, draw_line)
+            self.assertEqual(rendered, [0, 1])
+
+            buffer.prepare(rows, 120, 10, (4, ()), dirty_from=1, dirty_to=1)
+            buffer.draw(target, pygame.Rect(0, 0, 120, 20), 0, 0, draw_line)
+            self.assertEqual(rendered, [0, 1, 0, 1])
+        finally:
+            pygame.quit()
+
     def test_button_expands_and_centres_for_its_label(self) -> None:
         pygame.init()
         try:

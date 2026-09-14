@@ -172,6 +172,7 @@ class ProjectModal:
         if folder.is_dir():
             self.browser.root = folder
             self.browser.expanded_paths.clear()
+            self.browser.invalidate_tree()
             self.browser.tree_scroll.reset()
             self.status = f"BROWSING {folder.name.upper() or str(folder).upper()}"
 

@@ -8,6 +8,9 @@ PADDING = 18
 # Code rows: 22 px glyphs plus a compact 4 px of leading keeps the active-line
 # and selection blocks visually fitted to their text.
 LINE_HEIGHT = 26
+# The editor footer carries compact document statistics without competing with
+# the code viewport or horizontal-scroll track.
+EDITOR_STATUS_HEIGHT = 28
 # Pane labels, tree rows, and controls need a little more presence than the
 # dense code editor without changing the editor's deliberately compact type.
 UI_FONT_SIZE = 22

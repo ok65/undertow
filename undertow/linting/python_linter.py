@@ -88,6 +88,11 @@ class PythonLinter(EditorService):
 
     @staticmethod
     def _severity_for(code: str) -> str:
+        # Unused bindings are safe-but-noisy cleanup work, rather than a
+        # correctness failure. Ruff calls them F-series rules, but Undertow's
+        # presentation should keep red for code that will actually break.
+        if code in {"F401", "F841", "F842"}:
+            return "warning"
         if code == "E501":
             return "suggestion"
         if code.startswith(("E", "F", "invalid-")):

@@ -297,12 +297,13 @@ class PackageSymbolCache:
                     yield child, qualname
                 yield from cls._functions(child, qualname)
 
-    def lookup_imported_function(self, lines: list[str], symbol_name: str) -> FunctionInfo | None:
+    def lookup_imported_function(self, lines: list[str], symbol_name: str, tree: ast.AST | None = None) -> FunctionInfo | None:
         """Resolve a cached function through direct or qualified source imports."""
-        try:
-            tree = ast.parse("\n".join(lines))
-        except SyntaxError:
-            return None
+        if tree is None:
+            try:
+                tree = ast.parse("\n".join(lines))
+            except SyntaxError:
+                return None
         for node in ast.walk(tree):
             if isinstance(node, ast.ImportFrom) and node.module:
                 for imported in node.names:

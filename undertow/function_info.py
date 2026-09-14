@@ -17,6 +17,61 @@ class FunctionInfo:
     docstring: str
 
 
+class FunctionIndex:
+    """Incremental AST index for function-hover lookups in one document.
+
+    Hovering must never repeatedly parse a large file just because the cursor
+    moves between identifiers.  The editor supplies a monotonically changing
+    source revision whenever its text changes.
+    """
+
+    def __init__(self) -> None:
+        self._revision = -1
+        self._tree: ast.Module | None = None
+        self._definitions: dict[str, list[ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+        self._external: dict[str, FunctionInfo | None] = {}
+
+    def resolve(
+        self, lines: list[str], line: int, column: int, revision: int,
+        external_lookup: Callable[[str, ast.Module | None], FunctionInfo | None] | None = None,
+    ) -> FunctionInfo | None:
+        """Resolve the identifier under a position using the cached AST."""
+        if not 0 <= line < len(lines):
+            return None
+        self._refresh(lines, revision)
+        symbol = _qualified_identifier_at(lines[line], column)
+        if not symbol:
+            return None
+        name = symbol.rsplit(".", 1)[-1]
+        definitions = [] if "." in symbol else self._definitions.get(name, [])
+        if definitions:
+            node = min(definitions, key=lambda item: abs(item.lineno - 1 - line))
+            prototype = f"class {node.name}" if isinstance(node, ast.ClassDef) else function_prototype(node)
+            return FunctionInfo(name, node.lineno - 1, prototype, ast.get_docstring(node, clean=True) or "No docstring.")
+        if external_lookup is None:
+            return None
+        if symbol not in self._external:
+            self._external[symbol] = external_lookup(symbol, self._tree)
+        return self._external[symbol]
+
+    def _refresh(self, lines: list[str], revision: int) -> None:
+        if revision == self._revision:
+            return
+        self._revision = revision
+        self._external.clear()
+        try:
+            self._tree = ast.parse("\n".join(lines))
+        except SyntaxError:
+            self._tree = None
+            self._definitions = {}
+            return
+        definitions: dict[str, list[ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+        for node in ast.walk(self._tree):
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                definitions.setdefault(node.name, []).append(node)
+        self._definitions = definitions
+
+
 def function_at(
     lines: list[str], line: int, column: int,
     external_lookup: Callable[[list[str], str], FunctionInfo | None] | None = None,

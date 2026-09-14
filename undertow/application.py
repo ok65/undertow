@@ -10,17 +10,21 @@ from typing import Any
 import pygame
 from pygame._sdl2.video import Window
 
-from undertow.debugger import PythonDebugger
+from undertow.debugging import DebugService, PythonDebugger
+from undertow.documents import DocumentManager
+from undertow.context_actions import ContextActionController
 from undertow.doom_launcher import DoomLauncher
+from undertow.application_state import RenderState, ServiceState, TimingState, UIState, WindowState, WorkspaceLayoutState, WorkspaceRuntime, state_alias
 from undertow.editor import Editor
 from undertow.events import EventHandler
-from undertow.execution import ExecutionConfig, ExecutionManager
+from undertow.execution import ExecutionManager
 from undertow.gui_elements import GUIElements, TreeScroll, WindowControls
 from undertow.highlighting import PythonSyntaxHighlighter
 from undertow.input import EditorInputHandler
 from undertow.inspection import ProjectInspector
-from undertow.linting import Diagnostic, PythonLinter
+from undertow.linting import Diagnostic, LintScheduler, PythonLinter
 from undertow.panes import DebugControl, DebugControlsPane, EditorPane, InspectorPane, InterpreterPane, OutputPane, Pane, ProjectPane, StructurePane, TerminalPane, VariablesPane
+from undertow.performance import PerformanceCapture
 from undertow.project import UndertowProject
 from undertow.project_modal import ProjectModal
 from undertow.rendering import RendererMixin
@@ -31,7 +35,6 @@ from undertow.terminal import TerminalSession
 from undertow.theme import (
     APP_ICON,
     BACKGROUND_IMAGE,
-    LINE_HEIGHT,
     PADDING,
     PROJECT_ROOT,
     WINDOW_SIZE,
@@ -41,6 +44,46 @@ from undertow.workspace.workspace import Workspace
 
 
 class Undertow(RendererMixin):
+    # These aliases preserve the existing, deliberately simple coordinator
+    # calls while the actual mutable data has clear, focused owners below.
+    clock = state_alias("timing", "clock")
+    last_lint_tick = state_alias("timing")
+    last_interaction_tick = state_alias("timing")
+    performance_capture = state_alias("timing")
+    linter = state_alias("services")
+    lint_scheduler = state_alias("services")
+    project_inspector = state_alias("services")
+    roaster = state_alias("services")
+    syntax_highlighter = state_alias("services")
+    symbol_cache = state_alias("services")
+    symbol_scanner = state_alias("services")
+    doom_launcher = state_alias("services")
+    input_handler = state_alias("services")
+    event_handler = state_alias("services")
+    execution = state_alias("services")
+    debugger = state_alias("services")
+    terminal_panes = state_alias("runtime")
+    terminal_sessions = state_alias("runtime")
+    cursor_kind = state_alias("ui")
+    output = state_alias("ui")
+    status = state_alias("ui")
+    context_menu = state_alias("ui")
+    search_open = state_alias("ui")
+    search_replace_mode = state_alias("ui")
+    search_field = state_alias("ui")
+    search_query = state_alias("ui")
+    search_replacement = state_alias("ui")
+    search_preview_pending = state_alias("ui")
+    context_project_entry = state_alias("ui")
+    focus = state_alias("ui")
+    caret_on = state_alias("ui")
+    caret_tick = state_alias("ui")
+    drag_selecting = state_alias("ui")
+    hovered_diagnostic = state_alias("ui")
+    hovered_function = state_alias("ui")
+    tooltip_diagnostic = state_alias("ui")
+    tooltip_roast = state_alias("ui")
+    clipboard_available = state_alias("ui")
     def __init__(self, settings_path: Path | None = None) -> None:
         pygame.init()
         # SDL text input owns normal character composition; repeat still makes
@@ -54,74 +97,55 @@ class Undertow(RendererMixin):
         # not a replacement for obtaining the native window handle.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="Please use Window.get_surface", category=DeprecationWarning)
-            self.window = Window.from_display_module()
-        self.window_chrome = NativeWindowChrome(self.window)
-        self.window_chrome.configure()
-        self.window_controls = WindowControls()
-        self.window_maximized = False
-        self.window_dragging = False
+            window = Window.from_display_module()
+        window_chrome = NativeWindowChrome(window)
+        self.window_state = WindowState(window, window_chrome, WindowControls())
+        self.window_state.chrome.configure()
         pygame.key.start_text_input()
         pygame.display.set_caption("UNDERTOW / PYTHON")
-        self.clock = pygame.time.Clock()
+        now = pygame.time.get_ticks()
+        self.timing = TimingState(pygame.time.Clock(), 0, now, PerformanceCapture())
         self.gui = GUIElements()
         self.settings = UndertowSettings.load(settings_path)
         initial_editor = Editor()
-        self.linter = PythonLinter()
-        self.project_inspector = ProjectInspector(
-            interval_ms=int(self.settings["project_inspection_interval_ms"]), interpreter=self.linter.interpreter,
+        linter = PythonLinter()
+        lint_scheduler = LintScheduler(linter.lint)
+        project_inspector = ProjectInspector(
+            interval_ms=int(self.settings["project_inspection_interval_ms"]), interpreter=linter.interpreter,
         )
-        self.roaster = CodeRoaster()
-        self.syntax_highlighter = PythonSyntaxHighlighter()
-        self.symbol_cache = PackageSymbolCache()
-        self.symbol_scanner = SymbolScannerManager(self.symbol_cache, interval_ms=int(self.settings["symbol_scan_interval_ms"]))
-        self.doom_launcher = DoomLauncher(PROJECT_ROOT)
-        self.last_lint_tick = 0
-        self.last_autosave_tick = pygame.time.get_ticks()
-        self.last_external_file_check_tick = 0
-        self.project = UndertowProject.open(PROJECT_ROOT)
-        self.workspace = Workspace(self.project, initial_editor)
-        self.project_modal = ProjectModal.create(PROJECT_ROOT.parent)
-        self.last_code_pane_id = "pane-1"
-        self.terminal_panes: dict[str, TerminalPane] = {}
-        self.terminal_sessions: dict[str, TerminalSession] = {}
-        self.pane_rects: dict[str, pygame.Rect] = {}
-        self.dividers: list[tuple[Pane, pygame.Rect, pygame.Rect]] = []
-        self.dragging_divider: tuple[Pane, pygame.Rect] | None = None
-        self.dragging_horizontal_scroll: tuple[Editor, pygame.Rect] | None = None
-        self.cursor_kind: int | None = None
-        self.output = ["ready. F5 to run the current tide."]
-        self.status = "SYSTEM READY"
-        self.context_menu: tuple[int, int, str] | None = None
-        self.search_open = False
-        self.search_replace_mode = False
-        self.search_field = "query"
-        self.search_query = ""
-        self.search_replacement = ""
-        self.search_preview_pending = False
-        self.context_project_entry: Path | None = None
-        self.focus = "editor"
-        self.caret_on = True
-        self.caret_tick = 0
-        self.drag_selecting = False
-        self.hovered_diagnostic: tuple[Diagnostic, tuple[int, int]] | None = None
-        self.hovered_function: tuple[Any, tuple[int, int]] | None = None
-        self.tooltip_diagnostic: Diagnostic | None = None
-        self.tooltip_roast = ""
-        self.crt_overlay: pygame.Surface | None = None
-        self.overlay_size = (0, 0)
-        self.background_source = pygame.image.load(BACKGROUND_IMAGE).convert()
-        self.background_scaled: pygame.Surface | None = None
-        self.background_size = (0, 0)
-        self.ambient_glow: pygame.Surface | None = None
-        self.ambient_glow_size = (0, 0)
-        self.workspace.load()
-        # pygame-ce initializes the clipboard with the display; calling the
-        # old explicit init method emits a deprecation warning.
-        self.clipboard_available = True
-        self.input_handler = EditorInputHandler(None, None, None, self.save_document, self.run_code)
-        self.event_handler = EventHandler(self)
-        self.execution = ExecutionManager()
-        self.debugger = PythonDebugger()
+        symbol_cache = PackageSymbolCache()
+        self.services = ServiceState(
+            linter, lint_scheduler, project_inspector, CodeRoaster(), PythonSyntaxHighlighter(), symbol_cache,
+            SymbolScannerManager(symbol_cache, interval_ms=int(self.settings["symbol_scan_interval_ms"])), DoomLauncher(PROJECT_ROOT),
+            EditorInputHandler(None, None, None, lambda: None, lambda: None), EventHandler(self), ExecutionManager(), PythonDebugger(),
+        )
+        project = UndertowProject.open(PROJECT_ROOT)
+        self.runtime = WorkspaceRuntime(project, Workspace(project, initial_editor), ProjectModal.create(PROJECT_ROOT.parent))
+        self.layout_state = WorkspaceLayoutState()
+        self.ui = UIState()
+        self.context_controller = ContextActionController()
+        self.runtime.documents = DocumentManager(
+            lambda: [pane.editor for pane in self.runtime.workspace.leaves() if pane.editor is not None],
+            self.active_editor,
+            lambda status: setattr(self.ui, "status", status),
+            int(self.settings["autosave_interval_ms"]),
+            int(self.settings["external_file_check_interval_ms"]),
+        )
+        self.services.debugging = DebugService(
+            self.execution,
+            self.debugger,
+            self.active_editor,
+            lambda: self.active_pane,
+            self.runtime.workspace.find,
+            lambda: self.runtime.last_code_pane_id,
+            lambda pane_id: setattr(self.runtime, "last_code_pane_id", pane_id),
+            lambda status: setattr(self.ui, "status", status),
+        )
+        self.services.input_handler = EditorInputHandler(
+            None, None, None, self.runtime.documents.save_active, self.services.debugging.run_code,
+        )
+        self.render = RenderState(pygame.image.load(BACKGROUND_IMAGE).convert())
+        self.runtime.workspace.load()
 
     def layout(self) -> tuple[pygame.Rect, pygame.Rect, pygame.Rect]:
         width, height = self.screen.get_size()
@@ -136,31 +160,31 @@ class Undertow(RendererMixin):
     @property
     def root_pane(self) -> Pane:
         """Compatibility bridge while rendering migrates to Workspace."""
-        return self.workspace.root
+        return self.runtime.workspace.root
 
     @root_pane.setter
     def root_pane(self, value: Pane) -> None:
-        self.workspace.root = value
+        self.runtime.workspace.root = value
 
     @property
     def active_pane(self) -> str:
-        return self.workspace.active_pane_id
+        return self.runtime.workspace.active_pane_id
 
     @active_pane.setter
     def active_pane(self, value: str) -> None:
-        self.workspace.active_pane_id = value
+        self.runtime.workspace.active_pane_id = value
 
     @property
     def next_pane_id(self) -> int:
-        return self.workspace.next_pane_id
+        return self.runtime.workspace.next_pane_id
 
     @next_pane_id.setter
     def next_pane_id(self, value: int) -> None:
-        self.workspace.next_pane_id = value
+        self.runtime.workspace.next_pane_id = value
 
     @property
     def pane_factory(self):
-        return self.workspace.factory
+        return self.runtime.workspace.factory
 
     def active_editor(self) -> Editor | None:
         return self.find_pane(self.root_pane, self.active_pane).editor
@@ -184,47 +208,47 @@ class Undertow(RendererMixin):
     def handle_window_chrome_event(self, event: pygame.event.Event) -> tuple[bool, bool]:
         """Handle borderless-window controls and drag gestures before pane input."""
         if event.type == pygame.WINDOWMAXIMIZED:
-            self.window_maximized = True
+            self.window_state.maximized = True
             return False, False
         if event.type == pygame.WINDOWRESTORED:
-            self.window_maximized = False
+            self.window_state.maximized = False
             return False, False
         width, height = self.screen.get_size()
         if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            resize_hit = self.window_chrome.resize_hit_test(event.pos, (width, height))
-            if resize_hit is not None and self.window_chrome.start_resize(resize_hit):
+            resize_hit = self.window_state.chrome.resize_hit_test(event.pos, (width, height))
+            if resize_hit is not None and self.window_state.chrome.start_resize(resize_hit):
                 return True, False
-            action = self.window_controls.action_at(event.pos, width)
+            action = self.window_state.controls.action_at(event.pos, width)
             if action == "minimize":
-                self.window.minimize()
+                self.window_state.window.minimize()
                 return True, False
             if action == "maximize":
-                if self.window_maximized:
-                    self.window.restore()
+                if self.window_state.maximized:
+                    self.window_state.window.restore()
                 else:
-                    self.window.maximize()
+                    self.window_state.window.maximize()
                 return True, False
             if action == "close":
                 return True, True
             if event.pos[1] < WindowControls.HEIGHT:
-                if self.window_chrome.start_drag():
+                if self.window_state.chrome.start_drag():
                     return True, False
-                self.window_dragging = True
-                self.window.grab_mouse = True
+                self.window_state.dragging = True
+                self.window_state.window.grab_mouse = True
                 return True, False
-        elif event.type == pygame.MOUSEMOTION and self.window_dragging:
-            x, y = self.window.position
-            self.window.position = x + event.rel[0], y + event.rel[1]
+        elif event.type == pygame.MOUSEMOTION and self.window_state.dragging:
+            x, y = self.window_state.window.position
+            self.window_state.window.position = x + event.rel[0], y + event.rel[1]
             return True, False
-        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self.window_dragging:
-            self.window_dragging = False
-            self.window.grab_mouse = False
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1 and self.window_state.dragging:
+            self.window_state.dragging = False
+            self.window_state.window.grab_mouse = False
             return True, False
         return False, False
 
     def show_project_modal(self) -> None:
         """Return to the project-start gate without changing the current project."""
-        self.project_modal.show(self.project.root.parent)
+        self.runtime.project_modal.show(self.runtime.project.root.parent)
         self.focus = "sidebar"
         self.status = "PROJECT SELECTOR OPEN"
 
@@ -233,187 +257,47 @@ class Undertow(RendererMixin):
         try:
             project = UndertowProject.open(folder)
         except (OSError, ValueError) as error:
-            self.project_modal.status = f"CANNOT OPEN: {error}"[:80].upper()
+            self.runtime.project_modal.status = f"CANNOT OPEN: {error}"[:80].upper()
             return False
-        self.project = project
-        self.workspace.set_project(project)
+        self.runtime.project = project
+        self.runtime.workspace.set_project(project)
         for pane, _ in self.leaf_layout(self.root_pane, self.layout()[1]):
             if isinstance(pane.view, ProjectPane):
                 pane.view.root = project.root
                 pane.view.expanded_paths.clear()
+                pane.view.invalidate_tree()
                 pane.view.tree_scroll.reset()
         self._reset_workspace(project.entrypoint_path)
-        self.workspace.load()
+        self.runtime.workspace.load()
         try:
             self.settings.record_recent_project(project.root)
         except OSError:
             pass
-        self.project_modal.is_open = False
+        self.runtime.project_modal.is_open = False
         self.status = f"OPENED {project.name.upper()}"
         return True
 
     def drain_venv_events(self) -> None:
         """Finish a background environment build from the Pygame UI thread."""
-        self.project_modal.drain_venv_events(self.open_project_folder)
+        self.runtime.project_modal.drain_venv_events(self.open_project_folder)
 
     def _reset_workspace(self, entrypoint: Path) -> None:
         """Start a clean workspace before optionally restoring its saved layout."""
-        if self.workspace.project.root != self.project.root:
-            self.workspace.set_project(self.project)
-        self.workspace.reset(entrypoint)
+        if self.runtime.workspace.project.root != self.runtime.project.root:
+            self.runtime.workspace.set_project(self.runtime.project)
+        self.runtime.workspace.reset(entrypoint)
         self.output = ["ready. F5 to run the current tide."]
         self.reset_output_viewports()
         self.focus = "editor"
 
     def _pane_config(self, pane: Pane) -> dict[str, Any]:
-        return self.workspace._pane_config(pane)
+        return self.runtime.workspace._pane_config(pane)
 
     def _pane_from_config(self, data: dict[str, Any], documents: dict[str, list[str]]) -> Pane:
-        return self.workspace._pane_from_config(data, documents)
-
-    def split_active_pane(self, orientation: str) -> None:
-        self.workspace.split_active(orientation)
-        self.status = f"{orientation.upper()} SPLIT OPEN"
-
-    def choose_pane_kind(self, pane: Pane, choice: str) -> bool:
-        try:
-            replacement = self.workspace.choose_kind(pane.pane_id, choice)
-        except KeyError:
-            # Keep this narrow compatibility route for callers constructing a
-            # standalone chooser in tests; live panes always go via Workspace.
-            if pane.kind != "empty":
-                return False
-            replacement = self.pane_factory.create(pane.pane_id, choice)
-            pane.kind, pane.editor, pane.view = replacement.kind, replacement.editor, replacement.view
-            replacement = pane
-        if replacement is None:
-            return False
-        if choice == "code":
-            self.focus = "editor"
-        elif choice == "terminal":
-            self.focus = "terminal"
-            self.ensure_terminal(replacement.pane_id)
-        self.status = f"{choice.upper()} PANE OPEN"
-        return True
-
-    def kill_pane(self, pane_id: str) -> bool:
-        """Remove a leaf pane and promote its sibling into the parent slot."""
-        if self.workspace.leaf_count() <= 1:
-            self.status = "CANNOT KILL THE LAST PANE"
-            return False
-        self.close_terminal(pane_id)
-        removed = self.workspace.kill_pane(pane_id)
-        if removed:
-            self.status = "PANE KILLED"
-        return removed
-
-    def leaf_count(self, pane: Pane | None = None) -> int:
-        return self.workspace.leaf_count(pane)
-
-    def reset_pane(self, pane_id: str) -> bool:
-        """Return a leaf to the chooser without discarding a dirty code buffer."""
-        try:
-            pane = self.find_pane(self.root_pane, pane_id)
-        except KeyError:
-            return False
-        if pane.editor is not None and pane.editor.dirty:
-            if pane.editor.external_change_pending:
-                self.status = "EXTERNAL CHANGE PENDING — PANE NOT RESET"
-                return False
-            try:
-                pane.editor.save()
-            except OSError:
-                self.status = "SAVE FAILED — PANE NOT RESET"
-                return False
-        if pane.kind == "terminal":
-            self.close_terminal(pane_id)
-        self.workspace.reset_pane(pane_id)
-        self.focus = "sidebar"
-        self.status = "PANE RESET"
-        return True
-
-    def save_document(self) -> None:
-        editor = self.active_editor()
-        self.status = editor.save().upper()
-        for leaf, _ in self.leaf_layout(self.root_pane, self.layout()[1]):
-            if leaf.editor is not None and leaf.editor.lines is editor.lines:
-                leaf.editor.dirty = False
-
-    def autosave_dirty_documents(self, now_ms: int) -> int:
-        """Persist dirty code buffers at a calm, fixed cadence.
-
-        Editors can be separate views onto the same line buffer, so saving one
-        also clears the dirty marker on its sibling views.  A failed background
-        write leaves the document dirty for the next autosave attempt.
-        """
-        if now_ms - self.last_autosave_tick < int(self.settings["autosave_interval_ms"]):
-            return 0
-        self.last_autosave_tick = now_ms
-
-        leaves = self.leaf_layout(self.root_pane, self.layout()[1])
-        saved_buffers: set[int] = set()
-        saved = 0
-        for leaf, _ in leaves:
-            editor = leaf.editor
-            if editor is None or not editor.dirty or editor.external_change_pending or id(editor.lines) in saved_buffers:
-                continue
-            try:
-                editor.save()
-            except OSError:
-                continue
-            saved_buffers.add(id(editor.lines))
-            saved += 1
-            for sibling, _ in leaves:
-                if sibling.editor is not None and sibling.editor.lines is editor.lines:
-                    sibling.editor.dirty = False
-        return saved
-
-    def refresh_external_documents(self, now_ms: int) -> tuple[int, int]:
-        """Apply disk edits to clean buffers and protect dirty buffers from overwrite."""
-        if now_ms - self.last_external_file_check_tick < int(self.settings["external_file_check_interval_ms"]):
-            return 0, 0
-        self.last_external_file_check_tick = now_ms
-        leaves = self.leaf_layout(self.root_pane, self.layout()[1])
-        inspected_buffers: set[int] = set()
-        reloaded = conflicts = 0
-        for leaf, _ in leaves:
-            editor = leaf.editor
-            if editor is None or id(editor.lines) in inspected_buffers:
-                continue
-            inspected_buffers.add(id(editor.lines))
-            if not editor.has_external_change():
-                continue
-            siblings = [item.editor for item, _ in leaves if item.editor is not None and item.editor.lines is editor.lines]
-            if editor.dirty and editor.merge_external_disk_change():
-                for sibling in siblings:
-                    sibling.dirty = editor.dirty
-                    sibling.lint_pending = True
-                    sibling.record_disk_revision(editor.disk_lines)
-                reloaded += 1
-                continue
-            if editor.dirty or any(sibling.external_change_pending for sibling in siblings):
-                for sibling in siblings:
-                    sibling.external_change_pending = True
-                conflicts += 1
-                continue
-            if editor.reload_from_disk():
-                for sibling in siblings:
-                    sibling.dirty = False
-                    sibling.lint_pending = True
-                    sibling.record_disk_revision()
-                reloaded += 1
-            else:
-                for sibling in siblings:
-                    sibling.external_change_pending = True
-                conflicts += 1
-        if conflicts:
-            self.status = "EXTERNAL CHANGE PENDING — SAVE TO OVERWRITE"
-        elif reloaded:
-            self.status = f"RELOADED {reloaded} EXTERNAL FILE{'S' if reloaded != 1 else ''}"
-        return reloaded, conflicts
+        return self.runtime.workspace._pane_from_config(data, documents)
 
     def find_pane(self, pane: Pane, pane_id: str) -> Pane:
-        return self.workspace.find(pane_id, pane)
+        return self.runtime.workspace.find(pane_id, pane)
 
     def leaf_layout(self, pane: Pane, rect: pygame.Rect) -> list[tuple[Pane, pygame.Rect]]:
         if pane.is_leaf:
@@ -438,14 +322,14 @@ class Undertow(RendererMixin):
             actual_gap = max(0, rect.h - usable_height)
             second = pygame.Rect(rect.x, first.bottom + actual_gap, rect.w, usable_height - first_height)
             divider = pygame.Rect(rect.x, first.bottom, rect.w, actual_gap)
-        self.dividers.append((pane, divider, rect))
+        self.layout_state.record_divider(pane, divider, rect)
         return self.leaf_layout(pane.first, first) + self.leaf_layout(pane.second, second)
 
     def update_cursor(self, leaves: list[tuple[Pane, pygame.Rect]]) -> None:
         """Advertise text entry and draggable pane walls before a click."""
         position = pygame.mouse.get_pos()
-        divider = next(((pane, rect) for pane, rect, _ in self.dividers if rect.collidepoint(position)), None)
-        resize_hit = self.window_chrome.resize_hit_test(position, self.screen.get_size())
+        divider = self.layout_state.divider_at(position)
+        resize_hit = self.window_state.chrome.resize_hit_test(position, self.screen.get_size())
         if resize_hit in {10, 11}:
             kind = pygame.SYSTEM_CURSOR_SIZEWE
         elif resize_hit in {12, 15}:
@@ -459,7 +343,7 @@ class Undertow(RendererMixin):
         elif self.pointer_over_button(position, leaves) or self.pointer_over_tree_item(position, leaves):
             kind = pygame.SYSTEM_CURSOR_HAND
         elif any(
-            pane.kind == "code" and pane.editor is not None and self.editor_content_rect(rect).collidepoint(position)
+            pane.kind == "code" and isinstance(pane.view, EditorPane) and pane.view.editor_content_rect(rect).collidepoint(position)
             for pane, rect in leaves
         ):
             kind = pygame.SYSTEM_CURSOR_IBEAM
@@ -475,10 +359,10 @@ class Undertow(RendererMixin):
     def pointer_over_button(self, position: tuple[int, int], leaves: list[tuple[Pane, pygame.Rect]]) -> bool:
         """Identify conventional controls, never treating them as text entry."""
         width, _ = self.screen.get_size()
-        if self.window_controls.action_at(position, width) is not None:
+        if self.window_state.controls.action_at(position, width) is not None:
             return True
-        if self.project_modal.is_open:
-            return any(rect.collidepoint(position) for rect in self.project_modal.actions.values())
+        if self.runtime.project_modal.is_open:
+            return any(rect.collidepoint(position) for rect in self.runtime.project_modal.actions.values())
         for pane, rect in leaves:
             if pane.kind == "code" and any(bounds.collidepoint(position) for _control, bounds in self.code_header_controls(rect, pane.pane_id)):
                 return True
@@ -490,21 +374,21 @@ class Undertow(RendererMixin):
 
     def pointer_over_tree_item(self, position: tuple[int, int], leaves: list[tuple[Pane, pygame.Rect]]) -> bool:
         """Return whether the pointer is over a tree row with a click action."""
-        if self.project_modal.is_open:
-            if any(rect.collidepoint(position) for _path, rect in self.project_modal.recent_rows):
+        if self.runtime.project_modal.is_open:
+            if any(rect.collidepoint(position) for _path, rect in self.runtime.project_modal.recent_rows):
                 return True
-            if any(rect.collidepoint(position) for _path, rect in self.project_modal.toggle_rows):
+            if any(rect.collidepoint(position) for _path, rect in self.runtime.project_modal.toggle_rows):
                 return True
             return any(
                 rect.collidepoint(position) and (path.is_dir() or path.name == "pyproject.toml")
-                for path, rect in self.project_modal.rows
+                for path, rect in self.runtime.project_modal.rows
             )
         for pane, rect in leaves:
             if pane.kind == "project" and self.project_entry_at(position, rect, pane) is not None:
                 return True
             if pane.kind == "structure":
-                rows, editor = self.structure_rows(pane)
-                if editor is not None and self.structure_tree_viewport(pane, rect, len(rows)).item_index_at(position) is not None:
+                rows, editor = pane.view.rows_for(self)
+                if editor is not None and pane.view.tree_viewport(self, rect, len(rows)).item_index_at(position) is not None:
                     return True
             if pane.kind == "variables":
                 row = next((item for item, bounds in self.variable_rows(pane, rect) if bounds.collidepoint(position)), None)
@@ -515,118 +399,45 @@ class Undertow(RendererMixin):
                     return True
         return False
 
-    def visible_editor_lines(self, rect: pygame.Rect) -> int:
-        return max(1, (rect.h - 58) // LINE_HEIGHT)
-
-    def editor_content_rect(self, rect: pygame.Rect) -> pygame.Rect:
-        """The clipped code area, excluding line numbers, gutter, and scrollbar."""
-        return pygame.Rect(rect.x + 94, rect.y + 40, max(1, rect.w - 106), max(1, rect.h - 56))
-
-    @staticmethod
-    def breakpoint_gutter_rect(rect: pygame.Rect) -> pygame.Rect:
-        """Return the narrow, click-friendly rail before editor line numbers."""
-        return pygame.Rect(rect.x + 5, rect.y + 40, 18, max(1, rect.h - 56))
-
-    @staticmethod
-    def fold_gutter_rect(rect: pygame.Rect) -> pygame.Rect:
-        return pygame.Rect(rect.x + 24, rect.y + 40, 14, max(1, rect.h - 56))
-
-    def toggle_fold_at(self, editor: Editor, rect: pygame.Rect, position: tuple[int, int]) -> bool:
-        gutter = self.fold_gutter_rect(rect)
-        if not gutter.collidepoint(position):
-            return False
-        rows = editor.visible_rows()
-        display_row = int(editor.scroll + (position[1] - gutter.y) // LINE_HEIGHT)
-        if not 0 <= display_row < len(rows):
-            return False
-        return editor.toggle_fold(rows[display_row])
-
-    def toggle_breakpoint_at(self, editor: Editor, rect: pygame.Rect, position: tuple[int, int]) -> bool:
-        gutter = self.breakpoint_gutter_rect(rect)
-        if not gutter.collidepoint(position):
-            return False
-        visible_row = (position[1] - gutter.y) // LINE_HEIGHT
-        rows = editor.visible_rows()
-        display_row = int(editor.scroll + visible_row)
-        if not 0 <= display_row < len(rows):
-            return False
-        line = rows[display_row] + 1
-        added = self.debugger.toggle_breakpoint(editor.path, line)
-        self.status = f"BREAKPOINT {'SET' if added else 'CLEARED'}: {editor.path.name}:{line}"
-        return True
-
-    def maximum_horizontal_scroll(self, editor: Editor | None, rect: pygame.Rect) -> int:
-        if editor is None:
-            return 0
-        return max(0, max((self.measure_text(line, editor=True) for line in editor.lines), default=0) - self.editor_content_rect(rect).w)
-
-    def horizontal_scrollbar(self, editor: Editor | None, rect: pygame.Rect) -> tuple[pygame.Rect, pygame.Rect] | None:
-        content = self.editor_content_rect(rect)
-        maximum = self.maximum_horizontal_scroll(editor, rect)
-        if not maximum:
-            return None
-        widest = maximum + content.w
-        track = pygame.Rect(content.x, rect.bottom - 12, content.w, 6)
-        thumb_width = max(28, round(track.w * content.w / widest))
-        travel = max(1, track.w - thumb_width)
-        thumb_x = track.x + round(travel * editor.horizontal_scroll / maximum)
-        return track, pygame.Rect(thumb_x, track.y, thumb_width, track.h)
-
-    def set_horizontal_scroll_from_pointer(self, editor: Editor, rect: pygame.Rect, pointer_x: int) -> None:
-        scrollbar = self.horizontal_scrollbar(editor, rect)
-        if scrollbar is None:
-            return
-        track, thumb = scrollbar
-        maximum = self.maximum_horizontal_scroll(editor, rect)
-        travel = max(1, track.w - thumb.w)
-        editor.horizontal_scroll = round(maximum * max(0, min(travel, pointer_x - track.x - thumb.w // 2)) / travel)
-        self.clamp_editor_scroll(editor, rect)
-
-    def clamp_editor_scroll(self, editor: Editor, rect: pygame.Rect) -> None:
-        maximum_scroll = max(0, len(editor.visible_rows()) - self.visible_editor_lines(rect))
-        editor.scroll = max(0, min(editor.scroll, maximum_scroll))
-        editor.target_scroll = max(0, min(editor.target_scroll, maximum_scroll))
-        editor.horizontal_scroll = max(0, min(editor.horizontal_scroll, self.maximum_horizontal_scroll(editor, rect)))
-
-    def ensure_caret_visible(self, editor: Editor, rect: pygame.Rect) -> None:
-        """Adjust vertical scroll only when keyboard editing moves the caret away."""
-        visible = self.visible_editor_lines(rect)
-        rows = editor.visible_rows()
-        if editor.row not in rows:
-            editor.unfold_all()
-            rows = editor.visible_rows()
-        display_row = rows.index(editor.row)
-        if display_row < editor.scroll:
-            editor.target_scroll = display_row
-        elif display_row >= editor.scroll + visible:
-            editor.target_scroll = display_row - visible + 1
-        caret_x = self.measure_text(editor.current()[:editor.col], editor=True)
-        content_width = self.editor_content_rect(rect).w
-        if caret_x < editor.horizontal_scroll:
-            editor.horizontal_scroll = caret_x
-        elif caret_x > editor.horizontal_scroll + content_width - 4:
-            editor.horizontal_scroll = caret_x - content_width + 4
-        # Keyboard navigation must remain exact; only wheel movement eases.
-        editor.scroll = editor.target_scroll
-        self.clamp_editor_scroll(editor, rect)
-
-    def scroll_editor(self, editor: Editor, rect: pygame.Rect, lines: int) -> None:
-        """Scroll one code viewport without moving its selection or caret."""
-        editor.target_scroll += lines
-        self.clamp_editor_scroll(editor, rect)
-
     def update_smooth_editor_scroll(self, leaves: list[tuple[Pane, pygame.Rect]], delta_ms: int) -> None:
         """Ease wheel scrolling over a few frames while retaining precise caret moves."""
         # At the app's 30 FPS cap, a 70 ms settle time made the first wheel
         # frame jump nearly half the distance. Share the gentler tree pace.
         ease = min(1.0, delta_ms / TreeScroll.EASE_MS)
         for pane, rect in leaves:
-            editor = pane.editor
-            if editor is None:
+            if not isinstance(pane.view, EditorPane):
                 continue
+            editor = pane.view.editor
             difference = editor.target_scroll - editor.scroll
             editor.scroll = editor.target_scroll if abs(difference) < 0.01 else editor.scroll + difference * ease
-            self.clamp_editor_scroll(editor, rect)
+            pane.view.clamp_scroll(self, rect)
+
+    def target_frame_rate(self, leaves: list[tuple[Pane, pygame.Rect]], now_ms: int) -> int:
+        """Use full cadence only while input or a smooth view needs frames."""
+        if now_ms - self.last_interaction_tick < 500:
+            return int(self.settings["target_fps"])
+        for pane, _rect in leaves:
+            editor = pane.editor
+            if editor is not None and abs(editor.target_scroll - editor.scroll) >= 0.01:
+                return int(self.settings["target_fps"])
+            tree_scroll = getattr(pane.view, "tree_scroll", None)
+            if tree_scroll is not None and abs(tree_scroll.target - tree_scroll.scroll) >= 0.01:
+                return int(self.settings["target_fps"])
+        return int(self.settings["idle_fps"])
+
+    def toggle_performance_capture(self) -> None:
+        """Capture a bounded GUI-thread cProfile report for the active project."""
+        if self.performance_capture.active:
+            self.status = "PERF CAPTURE ALREADY RUNNING"
+            return
+        self.performance_capture.start(self.runtime.project.root)
+        self.status = f"PERF CAPTURE // {self.performance_capture.frames_to_capture} FRAMES"
+
+    def finish_profile_frame(self) -> None:
+        paths = self.performance_capture.end_frame()
+        if paths is not None:
+            _binary, report = paths
+            self.status = f"PERF REPORT SAVED // {report}"
 
     def update_smooth_tree_scroll(self, leaves: list[tuple[Pane, pygame.Rect]], delta_ms: int) -> None:
         """Advance every standard tree viewport toward its wheel-scroll target."""
@@ -639,15 +450,15 @@ class Undertow(RendererMixin):
                 count = len(VariablesPane.rows(self.execution.debug_variables, pane.view.collapsed_references))
                 pane.view.tree_scroll.update(delta_ms, self.variable_tree_viewport(pane, rect, count).maximum_scroll)
             elif pane.kind == "structure" and isinstance(pane.view, StructurePane):
-                rows, _ = self.structure_rows(pane)
-                pane.view.tree_scroll.update(delta_ms, self.structure_tree_viewport(pane, rect, len(rows)).maximum_scroll)
+                rows, _ = pane.view.rows_for(self)
+                pane.view.tree_scroll.update(delta_ms, pane.view.tree_viewport(self, rect, len(rows)).maximum_scroll)
             elif pane.kind == "inspector" and isinstance(pane.view, InspectorPane):
                 viewport = pane.view.tree_viewport(self, rect, len(pane.view.rows(self)))
                 pane.view.tree_scroll.update(delta_ms, viewport.maximum_scroll)
-        if self.project_modal.is_open and self.project_modal.tree_viewport_rect.w:
-            count = len(self.project_modal.browser.tree(maximum_depth=2))
-            browser = self.gui.tree_viewport(self.project_modal.tree_viewport_rect, count, self.project_modal.browser.tree_scroll.scroll, 27)
-            self.project_modal.browser.tree_scroll.update(delta_ms, browser.maximum_scroll)
+        if self.runtime.project_modal.is_open and self.runtime.project_modal.tree_viewport_rect.w:
+            count = len(self.runtime.project_modal.browser.tree(maximum_depth=2))
+            browser = self.gui.tree_viewport(self.runtime.project_modal.tree_viewport_rect, count, self.runtime.project_modal.browser.tree_scroll.scroll, 27)
+            self.runtime.project_modal.browser.tree_scroll.update(delta_ms, browser.maximum_scroll)
 
     def scroll_editor_under_pointer(
         self, position: tuple[int, int], leaves: list[tuple[Pane, pygame.Rect]], wheel_delta: int, horizontal_delta: int = 0,
@@ -660,21 +471,23 @@ class Undertow(RendererMixin):
             return False
         self.active_pane = pane.pane_id
         self.focus = "editor"
+        if not isinstance(pane.view, EditorPane):
+            return False
         if horizontal_delta:
             pane.editor.horizontal_scroll += horizontal_delta * 80
-            self.clamp_editor_scroll(pane.editor, rect)
+            pane.view.clamp_scroll(self, rect)
         elif pygame.key.get_mods() & pygame.KMOD_SHIFT:
             pane.editor.horizontal_scroll -= wheel_delta * 80
-            self.clamp_editor_scroll(pane.editor, rect)
+            pane.view.clamp_scroll(self, rect)
         else:
-            self.scroll_editor(pane.editor, rect, -wheel_delta * 3)
+            pane.view.scroll(self, rect, -wheel_delta * 3)
         return True
 
     def visible_output_lines(self, rect: pygame.Rect) -> int:
         return max(1, (rect.h - 42) // 24)
 
     def output_viewports(self) -> list[OutputPane]:
-        return [pane.view for pane in self.workspace.leaves() if isinstance(pane.view, OutputPane)]
+        return [pane.view for pane in self.runtime.workspace.leaves() if isinstance(pane.view, OutputPane)]
 
     def reset_output_viewports(self) -> None:
         for view in self.output_viewports():
@@ -698,39 +511,11 @@ class Undertow(RendererMixin):
         pane.view.scroll -= wheel_delta * 3
         self.clamp_output_scroll(pane, rect)
 
-    def run_code(self) -> None:
-        """Run the current buffer through the shared execution manager."""
-        editor = self.active_editor()
-        started = self.execution.start_run(ExecutionConfig("\n".join(editor.lines), editor.path.resolve()))
-        if not started:
-            self.status = "EXECUTION ALREADY RUNNING"
-
-    def debug_code(self) -> None:
-        """Launch the most recently focused code buffer through the debug backend."""
-        editor = self.debug_editor()
-        if editor is None:
-            self.status = "NO CODE BUFFER TO DEBUG"
-            return
-        started = self.execution.start_debug(ExecutionConfig("\n".join(editor.lines), editor.path.resolve()), self.debugger)
-        self.status = "DEBUG STARTING" if started else "EXECUTION ALREADY RUNNING"
-
-    def debug_editor(self) -> Editor | None:
-        """Keep controls usable after focus moves from code into a debug pane."""
-        active = self.find_pane(self.root_pane, self.active_pane)
-        if active.kind == "code" and active.editor is not None:
-            self.last_code_pane_id = active.pane_id
-            return active.editor
-        try:
-            previous = self.find_pane(self.root_pane, self.last_code_pane_id)
-        except KeyError:
-            return None
-        return previous.editor if previous.kind == "code" else None
-
     def code_header_controls(self, rect: pygame.Rect, pane_id: str) -> list[tuple[DebugControl, pygame.Rect]]:
         """Return the execution controls for one code pane's title rail."""
         controls: list[DebugControl] = [DebugControl("run", "RUN", not self.execution.is_running)]
         state = self.execution.debug_state
-        if state != "idle" and pane_id != self.last_code_pane_id:
+        if state != "idle" and pane_id != self.runtime.last_code_pane_id:
             controls.append(DebugControl("attached", "DEBUG:// ATTACHED", enabled=False))
         else:
             if state != "idle":
@@ -749,9 +534,9 @@ class Undertow(RendererMixin):
         if control is None or not control.enabled:
             return False
         if control.action == "run":
-            self.run_code()
+            self.services.debugging.run_code()
         elif control.action == "start":
-            self.debug_code()
+            self.services.debugging.debug_code()
         elif control.action == "continue":
             self.execution.debug_continue()
         elif control.action == "next":
@@ -784,53 +569,6 @@ class Undertow(RendererMixin):
         all_rows = VariablesPane.rows(self.execution.debug_variables, pane.view.collapsed_references)
         viewport = self.variable_tree_viewport(pane, rect, len(all_rows))
         pane.view.tree_scroll.scroll_by(rows, viewport.maximum_scroll)
-
-    def structure_rows(self, pane: Pane):
-        state = pane.view if isinstance(pane.view, StructurePane) else pane
-        if not isinstance(state, StructurePane):
-            return [], None
-        source_id = state.source_pane_id or self.last_code_pane_id
-        try:
-            source = self.find_pane(self.root_pane, source_id)
-        except KeyError:
-            source = None
-        editor = source.editor if source is not None and source.kind == "code" else self.debug_editor()
-        if editor is None:
-            return [], None
-        return StructurePane.rows(editor.lines, state.show_private, state.show_methods, state.show_variables), editor
-
-    def scroll_structure(self, pane: Pane, rect: pygame.Rect, rows: int) -> None:
-        if not isinstance(pane.view, StructurePane):
-            return
-        items, _ = self.structure_rows(pane)
-        viewport = self.structure_tree_viewport(pane, rect, len(items))
-        pane.view.tree_scroll.scroll_by(rows, viewport.maximum_scroll)
-
-    def structure_tree_viewport(self, pane: Pane, rect: pygame.Rect, item_count: int):
-        state = pane.view if isinstance(pane.view, StructurePane) else pane
-        scroll = state.tree_scroll.scroll if isinstance(state, StructurePane) else 0
-        return self.gui.tree_viewport(pygame.Rect(rect.x + 10, rect.y + 42, rect.w - 20, rect.h - 52), item_count, scroll, 25)
-
-    def scroll_project_tree(self, pane: Pane, rect: pygame.Rect, rows: int) -> None:
-        """Scroll the workspace project tree without exposing empty rows."""
-        if isinstance(pane.view, ProjectPane):
-            viewport = pane.view.tree_viewport(self.gui, rect)
-            pane.view.tree_scroll.scroll_by(rows, viewport.maximum_scroll)
-
-    def handle_structure_click(self, pane: Pane, rect: pygame.Rect, position: tuple[int, int]) -> bool:
-        items, editor = self.structure_rows(pane)
-        if editor is None: return False
-        viewport = self.structure_tree_viewport(pane, rect, len(items))
-        index = viewport.item_index_at(position)
-        if index is None: return False
-        row = items[index]
-        editor.row, editor.col = row.line, 0
-        editor.clear_selection()
-        target = self.find_pane(self.root_pane, pane.view.source_pane_id or self.last_code_pane_id)
-        self.active_pane, self.focus = target.pane_id, "editor"
-        pane_rect = self.pane_rects.get(target.pane_id)
-        if pane_rect: self.ensure_caret_visible(editor, pane_rect)
-        return True
 
     def handle_variable_click(self, pane: Pane, rect: pygame.Rect, position: tuple[int, int]) -> bool:
         if not isinstance(pane.view, VariablesPane):
@@ -893,7 +631,7 @@ class Undertow(RendererMixin):
             terminal = TerminalPane(pane_id)
         self.terminal_panes[pane_id] = terminal
         if pane_id not in self.terminal_sessions:
-            session = TerminalSession(self.project.root)
+            session = TerminalSession(self.runtime.project.root)
             self.terminal_sessions[pane_id] = session
             session.start()
         return terminal
@@ -1000,6 +738,39 @@ class Undertow(RendererMixin):
                 prefix = "! " if event.kind == "failed" else ""
                 terminal.lines.append(prefix + event.text)
             terminal.scroll = max(0, len(terminal.lines) - 1)
+
+    def _context_split(self, pane: Pane, orientation: str) -> None:
+        self.runtime.workspace.active_pane_id = pane.pane_id
+        self.runtime.workspace.split_active_pane(orientation)
+        self.status = f"{orientation.upper()} SPLIT OPEN"
+
+    def _context_kill(self, pane: Pane) -> None:
+        if self.runtime.workspace.leaf_count() <= 1:
+            self.status = "CANNOT KILL THE LAST PANE"
+            return
+        self.close_terminal(pane.pane_id)
+        if self.runtime.workspace.kill_pane(pane.pane_id):
+            self.status = "PANE KILLED"
+
+    def _context_reset(self, pane: Pane) -> None:
+        if pane.editor is not None and pane.editor.dirty:
+            if pane.editor.external_change_pending:
+                self.status = "EXTERNAL CHANGE PENDING — PANE NOT RESET"
+                return
+            try:
+                self.runtime.documents.save(pane.editor)
+            except OSError:
+                self.status = "SAVE FAILED — PANE NOT RESET"
+                return
+        self.close_terminal(pane.pane_id)
+        if self.runtime.workspace.reset_pane(pane.pane_id) is not None:
+            self.focus = "sidebar"
+            self.status = "PANE RESET"
+
+    def clear_output(self) -> None:
+        self.output = ["output cleared."]
+        self.reset_output_viewports()
+
     def context_action(self, pos: tuple[int, int]) -> None:
         if not self.context_menu:
             return
@@ -1007,31 +778,9 @@ class Undertow(RendererMixin):
         row = (pos[1] - y - 5) // 31
         actions = self.context_actions(target)
         if 0 <= row < len(actions):
-            action, _ = actions[row]
-            action_target = target
+            action = self.context_controller.actions_for(self, target)[row]
             self.active_pane = target
-            if action == "run": self.run_code()
-            elif action == "debug": self.debug_code()
-            elif action == "save": self.save_document()
-            elif action == "fold_all": self.active_editor().fold_all()
-            elif action == "unfold_all": self.active_editor().unfold_all()
-            elif action == "vsplit": self.split_active_pane("vertical")
-            elif action == "hsplit": self.split_active_pane("horizontal")
-            elif action == "clear_output":
-                self.output = ["output cleared."]
-                self.reset_output_viewports()
-            elif action in {"toggle_private", "toggle_methods", "toggle_structure_variables"}:
-                state = self.find_pane(self.root_pane, target).view
-                if isinstance(state, StructurePane):
-                    if action == "toggle_private": state.show_private = not state.show_private
-                    elif action == "toggle_methods": state.show_methods = not state.show_methods
-                    else: state.show_variables = not state.show_variables
-                    self.workspace.mark_dirty()
-            elif action == "open_project": self.show_project_modal()
-            elif action == "explore" and self.context_project_entry is not None:
-                self.explore_project_entry(self.context_project_entry)
-            elif action == "kill": self.kill_pane(action_target)
-            elif action == "reset": self.reset_pane(action_target)
+            self.context_controller.invoke(self, target, action)
         self.context_menu = None
         self.context_project_entry = None
 
@@ -1129,16 +878,16 @@ class Undertow(RendererMixin):
             self.drain_terminal_events()
             self.drain_venv_events()
             now_ms = pygame.time.get_ticks()
-            self.refresh_external_documents(now_ms)
-            self.autosave_dirty_documents(now_ms)
-            self.workspace.autosave(now_ms, int(self.settings["layout_autosave_interval_ms"]))
-            if not self.project_modal.is_open:
-                self.symbol_scanner.update(self.project.root, now_ms)
-                self.project_inspector.update(self.project.root, now_ms)
+            self.runtime.documents.refresh_external(now_ms)
+            self.runtime.documents.autosave(now_ms)
+            self.runtime.workspace.autosave(now_ms, int(self.settings["layout_autosave_interval_ms"]))
+            if not self.runtime.project_modal.is_open:
+                self.symbol_scanner.update(self.runtime.project.root, now_ms)
+                self.project_inspector.update(self.runtime.project.root, now_ms)
             sidebar, editor_area, output_rect = self.layout()
-            self.dividers = []
+            self.layout_state.begin_frame()
             leaves = self.leaf_layout(self.root_pane, editor_area)
-            self.pane_rects = {pane.pane_id: rect for pane, rect in leaves}
+            self.layout_state.publish_leaves(leaves)
             alive = self.event_handler.process(alive, sidebar, output_rect, leaves)
             self.update_smooth_editor_scroll(leaves, self.clock.get_time())
             self.update_smooth_tree_scroll(leaves, self.clock.get_time())
@@ -1147,69 +896,27 @@ class Undertow(RendererMixin):
                 self.caret_on = not self.caret_on
                 self.caret_tick = 0
             self.draw_background()
-            if self.project_modal.is_open:
+            if self.runtime.project_modal.is_open:
                 self.update_cursor([])
                 self.draw_header()
-                self.project_modal.draw(self)
+                self.runtime.project_modal.draw(self)
                 self.draw_crt_overlay()
                 pygame.display.flip()
-                self.clock.tick(int(self.settings["target_fps"]))
+                self.finish_profile_frame()
+                self.clock.tick(self.target_frame_rate([], pygame.time.get_ticks()))
                 continue
             # Context commands can mutate the pane tree, so never render from
             # the pre-event leaf list.
-            self.dividers = []
+            self.layout_state.begin_frame()
             leaves = self.leaf_layout(self.root_pane, editor_area)
-            self.pane_rects = {pane.pane_id: rect for pane, rect in leaves}
+            self.layout_state.publish_leaves(leaves)
             self.refresh_linting(leaves)
             self.update_cursor(leaves)
             self.draw_header()
             self.hovered_diagnostic = None
             self.hovered_function = None
             for pane, rect in leaves:
-                if pane.kind == "code" and pane.editor is not None:
-                    if isinstance(pane.view, EditorPane):
-                        pane.view.draw(self, rect)
-                    else:
-                        self.draw_empty_pane(rect)
-                elif pane.kind == "project":
-                    if isinstance(pane.view, ProjectPane):
-                        pane.view.draw(self, rect)
-                    else:
-                        self.draw_empty_pane(rect)
-                elif pane.kind == "output":
-                    if isinstance(pane.view, OutputPane):
-                        pane.view.draw(self, rect)
-                    else:
-                        self.draw_empty_pane(rect)
-                elif pane.kind == "variables":
-                    if isinstance(pane.view, VariablesPane):
-                        pane.view.draw(self, rect)
-                    else:
-                        self.draw_empty_pane(rect)
-                elif pane.kind == "structure":
-                    if isinstance(pane.view, StructurePane):
-                        pane.view.draw(self, rect)
-                    else:
-                        self.draw_empty_pane(rect)
-                elif pane.kind == "inspector":
-                    if isinstance(pane.view, InspectorPane):
-                        pane.view.draw(self, rect)
-                    else:
-                        self.draw_empty_pane(rect)
-                elif pane.kind == "interpreter":
-                    if isinstance(pane.view, InterpreterPane):
-                        pane.view.draw(self, rect)
-                    else:
-                        self.draw_empty_pane(rect)
-                elif pane.kind == "terminal":
-                    if isinstance(pane.view, TerminalPane):
-                        pane.view.draw(self, rect)
-                    else:
-                        self.draw_empty_pane(rect)
-                elif pane.kind == "empty":
-                    self.draw_empty_pane(rect)
-                else:
-                    self.draw_empty_pane(rect)
+                pane.draw(self, rect)
             if self.hovered_diagnostic is None:
                 self.tooltip_diagnostic = None
             self.draw_context()
@@ -1217,12 +924,14 @@ class Undertow(RendererMixin):
             self.draw_function_tooltip()
             self.draw_crt_overlay()
             pygame.display.flip()
-            self.clock.tick(int(self.settings["target_fps"]))
-        if not self.project_modal.is_open:
-            self.workspace.save()
+            self.finish_profile_frame()
+            self.clock.tick(self.target_frame_rate(leaves, pygame.time.get_ticks()))
+        if not self.runtime.project_modal.is_open:
+            self.runtime.workspace.save()
         self.execution.stop()
         self.symbol_scanner.stop()
         self.project_inspector.stop()
+        self.lint_scheduler.stop()
         for pane_id in tuple(self.terminal_sessions):
             self.close_terminal(pane_id)
         pygame.quit()

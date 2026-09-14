@@ -81,7 +81,7 @@ class Workspace:
                     pass
         raise KeyError(pane_id)
 
-    def split_active(self, orientation: str) -> str:
+    def split_active_pane(self, orientation: str) -> str:
         """Split the active leaf and return the newly created chooser pane ID."""
         if orientation not in {"vertical", "horizontal"}:
             raise ValueError("unknown split orientation")
@@ -99,7 +99,7 @@ class Workspace:
         self.mark_dirty()
         return new_id
 
-    def choose_kind(self, pane_id: str, choice: str) -> Pane | None:
+    def choose_pane_kind(self, pane_id: str, choice: str) -> Pane | None:
         """Turn an empty chooser into a fully initialised pane view."""
         allowed = {"code", "project", "output", "variables", "structure", "inspector", "interpreter", "terminal"}
         pane = self.find(pane_id)
