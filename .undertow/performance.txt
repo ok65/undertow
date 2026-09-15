@@ -1,0 +1,61 @@
+Undertow GUI profile: 120 frames
+Sorted by cumulative time
+
+         1354002 function calls (1352011 primitive calls) in 4.282 seconds
+
+   Ordered by: cumulative time
+   List reduced from 292 to 50 due to restriction <50>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+      119    2.847    0.024    2.847    0.024 {method 'tick' of 'pygame.time.Clock' objects}
+      240    0.040    0.000    0.732    0.003 editor.py:139(draw)
+     6278    0.641    0.000    0.641    0.000 {method 'blit' of 'pygame.surface.Surface' objects}
+      480    0.003    0.000    0.251    0.001 rendering.py:65(panel)
+      240    0.002    0.000    0.216    0.001 rendering.py:404(function_at_pointer)
+       83    0.000    0.000    0.209    0.003 function_info.py:34(resolve)
+       12    0.000    0.000    0.207    0.017 rendering.py:435(<lambda>)
+       12    0.023    0.002    0.207    0.017 package_cache.py:300(lookup_imported_function)
+    60024    0.030    0.000    0.170    0.000 ast.py:386(walk)
+      120    0.000    0.000    0.154    0.001 rendering.py:160(draw_crt_overlay)
+      480    0.003    0.000    0.142    0.000 large_text_buffer.py:74(draw)
+      120    0.006    0.000    0.138    0.001 project.py:45(draw)
+    60012    0.021    0.000    0.134    0.000 {method 'extend' of 'collections.deque' objects}
+      120    0.131    0.001    0.131    0.001 {built-in method pygame.display.flip}
+   120065    0.053    0.000    0.113    0.000 ast.py:280(iter_child_nodes)
+      481    0.001    0.000    0.106    0.000 __init__.py:932(resolve)
+      120    0.000    0.000    0.105    0.001 rendering.py:108(draw_background)
+      481    0.004    0.000    0.101    0.000 <frozen ntpath>:663(realpath)
+      962    0.090    0.000    0.090    0.000 {built-in method nt._getfinalpathname}
+   154955    0.032    0.000    0.044    0.000 ast.py:268(iter_fields)
+      119    0.000    0.000    0.037    0.000 scanner_manager.py:62(update)
+      119    0.001    0.000    0.035    0.000 project_inspector.py:199(update)
+     2280    0.017    0.000    0.035    0.000 rendering.py:293(draw_diagnostic_squiggle)
+       16    0.000    0.000    0.035    0.002 package_cache.py:218(has_active_jobs)
+   288671    0.028    0.000    0.028    0.000 {built-in method builtins.isinstance}
+       17    0.000    0.000    0.028    0.002 package_cache.py:39(_connect)
+     3360    0.004    0.000    0.026    0.000 gui_elements.py:108(text)
+      120    0.001    0.000    0.024    0.000 output.py:22(draw)
+      960    0.001    0.000    0.023    0.000 gui_elements.py:132(button)
+     2400    0.001    0.000    0.022    0.000 rendering.py:61(text)
+      960    0.006    0.000    0.022    0.000 button.py:38(draw)
+       52    0.022    0.000    0.022    0.000 {method 'execute' of 'sqlite3.Connection' objects}
+      240    0.007    0.000    0.021    0.000 rendering.py:310(draw_diagnostic_gutter)
+      120    0.001    0.000    0.021    0.000 application.py:450(update_cursor)
+     5677    0.020    0.000    0.020    0.000 {built-in method pygame.draw.rect}
+    14367    0.008    0.000    0.018    0.000 gui_elements.py:68(measure_text)
+      205    0.003    0.000    0.018    0.000 project.py:81(rows)
+      119    0.001    0.000    0.018    0.000 events.py:18(process)
+      120    0.001    0.000    0.017    0.000 rendering.py:492(draw_header)
+    10593    0.003    0.000    0.017    0.000 rendering.py:58(measure_text)
+      119    0.016    0.000    0.016    0.000 {built-in method pygame.event.get}
+      412    0.005    0.000    0.014    0.000 application.py:762(code_header_controls)
+    96134    0.013    0.000    0.013    0.000 {built-in method builtins.getattr}
+    51598    0.013    0.000    0.013    0.000 {method 'get' of 'dict' objects}
+     2870    0.003    0.000    0.011    0.000 tree_viewport.py:37(row_rect)
+      240    0.005    0.000    0.011    0.000 rendering.py:323(diagnostic_at_pointer)
+     3904    0.003    0.000    0.010    0.000 __init__.py:198(_str_normcase)
+      120    0.000    0.000    0.009    0.000 window_controls.py:36(draw)
+       86    0.001    0.000    0.009    0.000 application.py:481(pointer_over_button)
+       17    0.008    0.000    0.008    0.000 {method 'close' of 'sqlite3.Connection' objects}
+
+
