@@ -201,12 +201,12 @@ class RendererMixin:
             return
 
         try:
-            target = self.find_pane(self.root_pane, self.runtime.last_code_pane_id)
+            target = self.runtime.workspace.find(self.runtime.last_code_pane_id)
         except KeyError:
             target = None
         if target is None or target.kind != "code" or target.editor is None:
             target = next(
-                (pane for pane, _ in self.leaf_layout(self.root_pane, self.layout()[1]) if pane.kind == "code" and pane.editor is not None),
+                (pane for pane, _ in self.layout_state.leaf_layout(self.runtime.workspace.root, self.layout()[1]) if pane.kind == "code" and pane.editor is not None),
                 None,
             )
         if target is None:
@@ -214,7 +214,7 @@ class RendererMixin:
             # grows a fresh code pane beside the tree instead of replacing it.
             self.runtime.workspace.split_active_pane("vertical")
             self.status = "VERTICAL SPLIT OPEN"
-            target = self.find_pane(self.root_pane, self.active_pane)
+            target = self.runtime.workspace.find(self.active_pane)
             self.runtime.workspace.choose_pane_kind(target.pane_id, "code")
             self.focus = "editor"
             self.status = "CODE PANE OPEN"
@@ -236,7 +236,7 @@ class RendererMixin:
 
     def handle_project_click(self, pane: Any, position: tuple[int, int], rect: pygame.Rect, clicks: int) -> bool:
         if self.project_open_rect(rect).collidepoint(position):
-            self.show_project_modal()
+            self.services.project.show(self)
             return True
         entry = self.project_entry_at(position, rect, pane)
         if entry is None:

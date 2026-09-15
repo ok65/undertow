@@ -29,9 +29,8 @@ class InterpreterPane(Pane):
         """Draw this pause-aware interpreter transcript and prompt."""
         state = renderer.execution.debug_state
         renderer.panel(rect, renderer.pane_title("DEBUG", f"INTERPRETER / {state.upper()}"), renderer.active_pane == self.pane_id)
-        visible_count = max(1, (rect.h - 78) // 25)
-        maximum = max(0, len(self.history) - visible_count)
-        self.scroll = max(0, min(self.scroll, maximum))
+        visible_count = self.visible_lines(rect)
+        self.clamp_scroll(rect)
         for index, line in enumerate(self.history[self.scroll:self.scroll + visible_count]):
             color = CYAN if line.startswith(">>>") else KEYWORD if line.startswith("!") else INK
             renderer.text(renderer.screen, line[:100], (rect.x + 12, rect.y + 42 + index * 25), color)
@@ -42,6 +41,39 @@ class InterpreterPane(Pane):
         renderer.text(renderer.screen, prompt, (rect.x + 12, rect.bottom - 27), CYAN)
         renderer.text(renderer.screen, self.input_text[:80] if active else hint, (rect.x + 58, rect.bottom - 27), INK if active else DIM)
 
+    @staticmethod
+    def visible_lines(rect: pygame.Rect) -> int:
+        return max(1, (rect.h - 78) // 25)
+
+    def clamp_scroll(self, rect: pygame.Rect) -> None:
+        self.scroll = max(0, min(self.scroll, max(0, len(self.history) - self.visible_lines(rect))))
+
+    def scroll_by(self, rect: pygame.Rect, rows: int) -> None:
+        self.scroll += rows
+        self.clamp_scroll(rect)
+
+    def submit(self, execution: Any) -> None:
+        expression = self.input_text.strip()
+        if not expression:
+            return
+        self.history.append(f">>> {expression}")
+        self.input_text = ""
+        if not execution.debug_evaluate(expression):
+            self.history.append("! PAUSE AT A BREAKPOINT BEFORE EVALUATING")
+        self.scroll = max(0, len(self.history) - 1)
+
+    def handle_key(self, event: pygame.event.Event, execution: Any) -> None:
+        if event.key == pygame.K_RETURN:
+            self.submit(execution)
+        elif event.key == pygame.K_BACKSPACE:
+            self.input_text = self.input_text[:-1]
+
+    def handle_text(self, text: str) -> None:
+        self.input_text += text
+
+    def append_result(self, text: str, error: bool = False) -> None:
+        self.history.append(f"! {text}" if error else text or "None")
+        self.scroll = max(0, len(self.history) - 1)
 
     @staticmethod
     def prompt(state: str) -> str:

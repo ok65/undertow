@@ -89,7 +89,7 @@ class Pane:
         # Lightweight layout nodes used by callers/tests may not have a
         # concrete view attached yet; retain the pane-kind contract there too.
         if not extras and self.kind == "project":
-            extras.append(ContextAction("open_project", "OPEN / CREATE PROJECT", lambda owner, _pane: owner.show_project_modal()))
+            extras.append(ContextAction("open_project", "OPEN / CREATE PROJECT", lambda owner, _pane: owner.services.project.show(owner)))
             if owner_entry := getattr(app, "context_project_entry", None):
                 extras.append(ContextAction("explore", "EXPLORE HERE", lambda owner, _pane: owner.explore_project_entry(owner_entry)))
         return [*extras, *defaults]

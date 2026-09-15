@@ -34,12 +34,12 @@ class VariablesPane(Pane):
     def draw(self, renderer: Any, rect: pygame.Rect) -> None:
         """Draw this debugger variable tree from the shared debug session."""
         renderer.panel(rect, renderer.pane_title("DEBUG", f"VARIABLES / {renderer.execution.debug_state.upper()}"), renderer.active_pane == self.pane_id)
-        rows = renderer.variable_rows(self, rect)
+        rows = self.visible_rows(renderer, rect)
         if not rows:
             message = "PAUSE AT A BREAKPOINT TO INSPECT" if renderer.execution.debug_state != "paused" else "NO VARIABLES IN THIS FRAME"
             renderer.text(renderer.screen, message, (rect.x + 14, rect.y + 48), DIM)
             return
-        viewport = renderer.variable_tree_viewport(self, rect, len(self.rows(renderer.execution.debug_variables, self.collapsed_references)))
+        viewport = self.tree_viewport(renderer, rect)
         old_clip = renderer.screen.get_clip()
         renderer.screen.set_clip(viewport.rect)
         for row, bounds in rows:
@@ -55,6 +55,42 @@ class VariablesPane(Pane):
                 renderer.text(renderer.screen, variable.type_name[:20], (bounds.right - 110, bounds.y + 2), DIM)
         renderer.screen.set_clip(old_clip)
         renderer.gui.draw_tree_scrollbar(renderer.screen, viewport)
+
+    def all_rows(self, renderer: Any) -> list[VariableRow]:
+        return self.rows(renderer.execution.debug_variables, self.collapsed_references)
+
+    def tree_viewport(self, renderer: Any, rect: pygame.Rect):
+        bounds = pygame.Rect(rect.x + 10, rect.y + 42, rect.w - 20, rect.h - 52)
+        return renderer.gui.tree_viewport(bounds, len(self.all_rows(renderer)), self.tree_scroll.scroll, 25)
+
+    def visible_rows(self, renderer: Any, rect: pygame.Rect) -> list[tuple[VariableRow, pygame.Rect]]:
+        rows = self.all_rows(renderer)
+        viewport = self.tree_viewport(renderer, rect)
+        return [(rows[index], viewport.row_rect(visible_index)) for visible_index, index in enumerate(viewport.visible_indices())]
+
+    def scroll(self, renderer: Any, rect: pygame.Rect, rows: int) -> None:
+        self.tree_scroll.scroll_by(rows, self.tree_viewport(renderer, rect).maximum_scroll)
+
+    def row_at(self, renderer: Any, rect: pygame.Rect, position: tuple[int, int]) -> VariableRow | None:
+        return next((row for row, bounds in self.visible_rows(renderer, rect) if bounds.collidepoint(position)), None)
+
+    def handle_click(self, renderer: Any, rect: pygame.Rect, position: tuple[int, int]) -> bool:
+        """Expand/collapse an object, requesting its children on first use."""
+        row = self.row_at(renderer, rect, position)
+        if row is None or not row.variable.can_expand:
+            return False
+        reference = row.variable.variables_reference
+        if reference in self.collapsed_references:
+            self.collapsed_references.remove(reference)
+        elif row.variable.children:
+            self.collapsed_references.add(reference)
+        else:
+            renderer.execution.debug_expand_variable(reference)
+        return True
+
+    def reset(self) -> None:
+        self.collapsed_references.clear()
+        self.tree_scroll.reset()
 
     @staticmethod
     def rows(variables: tuple[DebugVariable, ...], collapsed_references: set[int]) -> list[VariableRow]:

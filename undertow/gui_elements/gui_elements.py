@@ -142,5 +142,37 @@ class GUIElements:
     def tree_viewport(rect: pygame.Rect, item_count: int, scroll: float, row_height: int) -> TreeViewport:
         return TreeViewport(rect, item_count, scroll, row_height)
 
+    def update_smooth_tree_scroll(self, renderer: object, leaves: list[tuple[object, pygame.Rect]], delta_ms: int) -> None:
+        """Advance every visible tree viewport toward its requested scroll.
+
+        Each pane owns its :class:`TreeScroll`; this shared GUI operation only
+        calculates the current bounds needed to clamp the animation.  Keeping
+        that plumbing here leaves the application loop as a coordinator.
+        """
+        for pane, rect in leaves:
+            view = getattr(pane, "view", None)
+            tree_scroll = getattr(view, "tree_scroll", None)
+            if tree_scroll is None:
+                continue
+            if pane.kind == "project":
+                viewport = view.tree_viewport(self, rect)
+            elif pane.kind == "variables":
+                viewport = view.tree_viewport(renderer, rect)
+            elif pane.kind == "structure":
+                rows, _editor = view.rows_for(renderer)
+                viewport = view.tree_viewport(renderer, rect, len(rows))
+            elif pane.kind == "inspector":
+                viewport = view.tree_viewport(renderer, rect, len(view.rows(renderer)))
+            else:
+                continue
+            tree_scroll.update(delta_ms, viewport.maximum_scroll)
+
+        modal = renderer.runtime.project_modal
+        if modal.is_open and modal.mode in {"open", "create"}:
+            # The modal lays out its tree independently and records its visible
+            # row count during draw, so it supplies the matching clamp here.
+            maximum = max(0, len(modal.browser.tree(maximum_depth=2)) - modal.visible_rows)
+            modal.browser.tree_scroll.update(delta_ms, maximum)
+
     tree_row = staticmethod(TreeView.draw_row)
     draw_tree_scrollbar = staticmethod(TreeView.draw_scrollbar)

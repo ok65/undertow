@@ -12,11 +12,17 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 import pygame
 
 from undertow.application import Undertow
+from undertow.debug_values import DebugVariable
 from undertow.editor import Editor
+from undertow.gui_elements import GUIElements
+from undertow.execution import ExecutionEvent
+from undertow.execution_ui import ExecutionUIController
 from undertow.interpreters import PythonInterpreter, VenvCreator, VenvEvent, discover_installed_pythons
-from undertow.panes import DebugControlsPane, EditorPane, InspectorPane, OutputPane, Pane, ProjectPane, StructurePane, VariablesPane
+from undertow.panes import DebugControlsPane, EditorPane, InspectorPane, InterpreterPane, OutputPane, Pane, ProjectPane, StructurePane, TerminalPane, VariablesPane
 from undertow.project import UndertowProject
 from undertow.settings import UndertowSettings
+from undertow.search_controller import SearchController
+from undertow.terminal_manager import TerminalManager
 from undertow.workspace import Pane as WorkspacePane
 from undertow.workspace.pane_factory import PaneFactory
 
@@ -54,6 +60,85 @@ class ProjectLayoutTests(unittest.TestCase):
             self.assertIsInstance(pane.view, OutputPane)
             self.assertEqual(pane.view.pane_id, "output")
 
+    def test_output_pane_owns_its_scroll_and_follow_state(self) -> None:
+        pane = OutputPane("output")
+        transcript = [f"line {number}" for number in range(30)]
+        rect = pygame.Rect(0, 0, 400, 140)
+
+        pane.scroll_by_wheel(transcript, rect, 1)
+
+        self.assertFalse(pane.follow)
+        self.assertGreaterEqual(pane.scroll, 0)
+        pane.reset()
+        self.assertEqual((pane.scroll, pane.follow), (0, True))
+
+    def test_variables_pane_owns_tree_hit_testing_and_expand_request(self) -> None:
+        variable = DebugVariable("config", "{}", variables_reference=7)
+        requested: list[int] = []
+        renderer = SimpleNamespace(
+            execution=SimpleNamespace(debug_variables=(variable,), debug_expand_variable=requested.append),
+            gui=SimpleNamespace(tree_viewport=GUIElements.tree_viewport),
+        )
+        pane = VariablesPane("variables")
+        rect = pygame.Rect(0, 0, 400, 180)
+        row = pane.visible_rows(renderer, rect)[0][1]
+
+        self.assertTrue(pane.handle_click(renderer, rect, row.center))
+        self.assertEqual(requested, [7])
+
+    def test_interpreter_pane_submits_and_records_its_own_history(self) -> None:
+        evaluated: list[str] = []
+        pane = InterpreterPane("interpreter")
+        pane.input_text = "count = 12"
+
+        pane.submit(SimpleNamespace(debug_evaluate=lambda expression: evaluated.append(expression) or True))
+
+        self.assertEqual(evaluated, ["count = 12"])
+        self.assertEqual(pane.history[-1], ">>> count = 12")
+        pane.append_result("12")
+        self.assertEqual(pane.history[-1], "12")
+
+    def test_terminal_manager_owns_one_session_per_pane(self) -> None:
+        pane = TerminalPane("terminal")
+        with patch("undertow.terminal_manager.TerminalSession") as session_type:
+            manager = TerminalManager()
+            manager.ensure(pane, Path.cwd())
+            manager.ensure(pane, Path.cwd())
+
+            session_type.assert_called_once_with(Path.cwd())
+            session_type.return_value.start.assert_called_once()
+            manager.close("terminal")
+            session_type.return_value.stop.assert_called_once()
+
+    def test_search_controller_keeps_preview_then_apply_replace_flow(self) -> None:
+        app = SimpleNamespace(
+            search_open=False, search_replace_mode=False, search_field="query", search_query="",
+            search_replacement="", search_preview_pending=False, focus="editor",
+        )
+        editor = Editor(lines=["wave wave"])
+        controller = SearchController()
+
+        controller.open(app, editor, replace=True)
+        app.search_query = "wave"
+        controller.handle_key(app, editor, pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, mod=0))
+        self.assertEqual(editor.selected_text(), "wave")
+        controller.handle_text(app, "shore")
+        controller.handle_key(app, editor, pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, mod=0))
+        controller.handle_key(app, editor, pygame.event.Event(pygame.KEYDOWN, key=pygame.K_RETURN, mod=0))
+
+        self.assertEqual(editor.lines, ["shore wave"])
+
+    def test_execution_ui_controller_translates_events_without_app_methods(self) -> None:
+        app = SimpleNamespace(
+            execution=SimpleNamespace(drain_events=lambda: [ExecutionEvent("started", "> running tide.py"), ExecutionEvent("finished", returncode=0)]),
+            runtime=SimpleNamespace(workspace=SimpleNamespace(leaves=lambda: [])), output=[], status="",
+        )
+
+        ExecutionUIController().drain(app)
+
+        self.assertEqual(app.output, ["> running tide.py", "process finished with no output."])
+        self.assertEqual(app.status, "COMPLETE")
+
     def test_debug_controls_offer_actions_for_each_session_state(self) -> None:
         self.assertEqual([control.action for control in DebugControlsPane.controls("idle")], ["start"])
         self.assertEqual(DebugControlsPane.controls("idle")[0].label, "DEBUG:// ATTACH")
@@ -68,11 +153,13 @@ class ProjectLayoutTests(unittest.TestCase):
             app = Undertow(settings_path=Path(directory) / "settings.toml")
             try:
                 rect = pygame.Rect(0, 0, 800, 300)
-                controls = app.code_header_controls(rect, app.active_pane)
+                pane = app.runtime.workspace.active_editor_pane()
+                self.assertIsNotNone(pane)
+                controls = pane.code_header_controls(app, rect)
                 self.assertEqual([control.action for control, _ in controls], ["run", "start"])
                 self.assertEqual([control.label for control, _ in controls], ["RUN", "DEBUG:// ATTACH"])
                 with patch.object(app.services.debugging, "run_code") as run_code:
-                    self.assertTrue(app.handle_code_header_click(app.active_pane, rect, controls[0][1].center))
+                    self.assertTrue(pane.handle_code_header_click(app, rect, controls[0][1].center))
                     run_code.assert_called_once()
             finally:
                 pygame.quit()
@@ -83,13 +170,12 @@ class ProjectLayoutTests(unittest.TestCase):
             app = Undertow(settings_path=root / "settings.toml")
             try:
                 pane = Pane("terminal", kind="terminal")
-                self.assertEqual(app._pane_config(pane), {"id": "terminal", "type": "terminal"})
-                self.assertEqual(app._pane_from_config({"id": "terminal", "type": "terminal"}, {}).kind, "terminal")
+                self.assertEqual(app.runtime.workspace._pane_config(pane), {"id": "terminal", "type": "terminal"})
+                self.assertEqual(app.runtime.workspace._pane_from_config({"id": "terminal", "type": "terminal"}, {}).kind, "terminal")
                 pane_id = app.runtime.workspace.split_active_pane("vertical")
                 self.assertIsNotNone(app.runtime.workspace.choose_pane_kind(pane_id, "terminal"))
             finally:
-                for pane_id in tuple(app.terminal_sessions):
-                    app.close_terminal(pane_id)
+                app.services.terminal_manager.close_all()
                 pygame.quit()
 
     def test_project_inspector_is_a_serializable_workspace_pane(self) -> None:
@@ -97,8 +183,8 @@ class ProjectLayoutTests(unittest.TestCase):
             app = Undertow(settings_path=Path(directory) / "settings.toml")
             try:
                 pane = Pane("inspector", kind="inspector")
-                self.assertEqual(app._pane_config(pane), {"id": "inspector", "type": "inspector"})
-                self.assertEqual(app._pane_from_config({"id": "inspector", "type": "inspector"}, {}).kind, "inspector")
+                self.assertEqual(app.runtime.workspace._pane_config(pane), {"id": "inspector", "type": "inspector"})
+                self.assertEqual(app.runtime.workspace._pane_from_config({"id": "inspector", "type": "inspector"}, {}).kind, "inspector")
                 pane_id = app.runtime.workspace.split_active_pane("vertical")
                 self.assertIsNotNone(app.runtime.workspace.choose_pane_kind(pane_id, "inspector"))
             finally:
@@ -158,7 +244,7 @@ class ProjectLayoutTests(unittest.TestCase):
                 pane = Pane("code", kind="code", editor=editor, view=EditorPane("code", editor))
                 rect = pygame.Rect(0, 0, 300, 220)
 
-                self.assertTrue(app.scroll_editor_under_pointer(rect.center, [(pane, rect)], 0, horizontal_delta=1))
+                pane.view.scroll_under_pointer(app, rect, 0, horizontal_delta=1)
                 self.assertGreater(editor.horizontal_scroll, 0)
             finally:
                 app.project_inspector.stop()
@@ -220,13 +306,13 @@ class ProjectLayoutTests(unittest.TestCase):
             source.write_text("answer = 42\n", encoding="utf-8")
             app = Undertow(settings_path=root / "settings.toml")
             try:
-                app._reset_workspace(source)
+                app.services.project.reset_workspace(app, source)
                 app.active_pane = "project-pane"
                 app.open_project_file(source)
-                editor = app.find_pane(app.root_pane, "pane-1").editor
+                editor = app.runtime.workspace.find("pane-1").editor
                 self.assertEqual(editor.lines, ["answer = 42"])
                 self.assertEqual(app.active_pane, "pane-1")
-                self.assertEqual(app.find_pane(app.root_pane, "project-pane").kind, "project")
+                self.assertEqual(app.runtime.workspace.find("project-pane").kind, "project")
             finally:
                 pygame.quit()
 
@@ -235,16 +321,16 @@ class ProjectLayoutTests(unittest.TestCase):
             root = Path(directory)
             app = Undertow(settings_path=root / "settings.toml")
             try:
-                app._reset_workspace(root / "main.py")
+                app.services.project.reset_workspace(app, root / "main.py")
                 app.runtime.project_modal.is_open = False
                 rect = pygame.Rect(0, 0, 300, 500)
-                project_pane = next(pane for pane, _ in app.leaf_layout(app.root_pane, app.layout()[1]) if pane.kind == "project")
+                project_pane = next(pane for pane, _ in app.layout_state.leaf_layout(app.root_pane, app.layout()[1]) if pane.kind == "project")
                 self.assertTrue(app.handle_project_click(project_pane, app.project_open_rect(rect).center, rect, 1))
                 self.assertTrue(app.runtime.project_modal.is_open)
                 self.assertEqual(app.runtime.project_modal.mode, "choose")
                 app.runtime.project_modal.is_open = False
                 app.context_menu = (10, 10, "project-pane")
-                with patch.object(app, "show_project_modal") as show_modal:
+                with patch.object(app.services.project, "show") as show_modal:
                     app.context_action((10, 15))
                 show_modal.assert_called_once()
             finally:
@@ -255,10 +341,10 @@ class ProjectLayoutTests(unittest.TestCase):
             root = Path(directory)
             app = Undertow(settings_path=root / "settings.toml")
             try:
-                app._reset_workspace(root / "main.py")
+                app.services.project.reset_workspace(app, root / "main.py")
                 app.runtime.project_modal.is_open = False
                 app.active_pane, app.focus = "project-pane", "editor"
-                leaves = app.leaf_layout(app.root_pane, pygame.Rect(0, 0, 900, 600))
+                leaves = app.layout_state.leaf_layout(app.root_pane, pygame.Rect(0, 0, 900, 600))
                 app.layout_state.publish_leaves(leaves)
                 pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_a, mod=0))
                 self.assertTrue(app.event_handler.process(True, pygame.Rect(0, 0, 0, 0), pygame.Rect(0, 0, 0, 0), leaves))
@@ -273,8 +359,8 @@ class ProjectLayoutTests(unittest.TestCase):
             entrypoint.write_text("pass\n", encoding="utf-8")
             app = Undertow(settings_path=root / "settings.toml")
             try:
-                app._reset_workspace(entrypoint)
-                leaves = app.leaf_layout(app.root_pane, pygame.Rect(0, 0, 1200, 700))
+                app.services.project.reset_workspace(app, entrypoint)
+                leaves = app.layout_state.leaf_layout(app.root_pane, pygame.Rect(0, 0, 1200, 700))
                 self.assertEqual([(pane.pane_id, pane.kind) for pane, _ in leaves], [("project-pane", "project"), ("pane-1", "code")])
                 self.assertEqual(app.active_pane, "pane-1")
             finally:
@@ -285,12 +371,12 @@ class ProjectLayoutTests(unittest.TestCase):
             root = Path(directory)
             app = Undertow(settings_path=root / "settings.toml")
             try:
-                app._reset_workspace(root / "main.py")
+                app.services.project.reset_workspace(app, root / "main.py")
                 # This models restoring a busy layout into a relatively small
                 # window: every leaf must remain safe for Pygame rendering.
                 for orientation in ("vertical", "horizontal", "vertical", "horizontal"):
                     app.runtime.workspace.split_active_pane(orientation)
-                leaves = app.leaf_layout(app.root_pane, pygame.Rect(0, 0, 320, 240))
+                leaves = app.layout_state.leaf_layout(app.root_pane, pygame.Rect(0, 0, 320, 240))
                 self.assertTrue(all(rect.w > 0 and rect.h > 0 for _, rect in leaves))
             finally:
                 pygame.quit()
@@ -302,7 +388,7 @@ class ProjectLayoutTests(unittest.TestCase):
             entrypoint.write_text("pass\n", encoding="utf-8")
             app = Undertow(settings_path=root / "settings.toml")
             try:
-                app._reset_workspace(entrypoint)
+                app.services.project.reset_workspace(app, entrypoint)
                 self.assertTrue(app.runtime.workspace.kill_pane("project-pane"))
                 self.assertEqual(app.runtime.workspace.leaf_count(app.root_pane), 1)
                 self.assertFalse(app.runtime.workspace.kill_pane(app.root_pane.pane_id))
@@ -324,7 +410,7 @@ class ProjectLayoutTests(unittest.TestCase):
             app = Undertow(settings_path=root / "settings.toml")
             try:
                 app.runtime.project = project
-                app._reset_workspace(source)
+                app.services.project.reset_workspace(app, source)
                 self.assertIsNotNone(app.runtime.workspace.load())
                 self.assertTrue(app.runtime.workspace.kill_pane("project-pane"))
                 app.runtime.workspace.save()
@@ -332,9 +418,9 @@ class ProjectLayoutTests(unittest.TestCase):
                 restored = Undertow(settings_path=root / "settings.toml")
                 try:
                     restored.runtime.project = project
-                    restored._reset_workspace(source)
+                    restored.services.project.reset_workspace(restored, source)
                     self.assertIsNotNone(restored.runtime.workspace.load())
-                    self.assertNotIn("project-pane", {pane.pane_id for pane, _ in restored.leaf_layout(restored.root_pane, pygame.Rect(0, 0, 1000, 600))})
+                    self.assertNotIn("project-pane", {pane.pane_id for pane, _ in restored.layout_state.leaf_layout(restored.root_pane, pygame.Rect(0, 0, 1000, 600))})
                 finally:
                     pygame.quit()
             finally:
@@ -356,7 +442,7 @@ class ProjectLayoutTests(unittest.TestCase):
             root = Path(directory)
             app = Undertow(settings_path=root / "settings.toml")
             try:
-                restored = app._pane_from_config({"id": "debug", "type": "debug_controls"}, {})
+                restored = app.runtime.workspace._pane_from_config({"id": "debug", "type": "debug_controls"}, {})
                 self.assertEqual(restored.kind, "empty")
             finally:
                 pygame.quit()
@@ -389,8 +475,8 @@ class ProjectLayoutTests(unittest.TestCase):
             try:
                 # A persisted layout may make the project tree active on startup;
                 # autosave itself is a code-document concern.
-                app._reset_workspace(source)
-                editor = app.active_editor()
+                app.services.project.reset_workspace(app, source)
+                editor = app.runtime.workspace.active_editor()
                 self.assertIsNotNone(editor)
                 assert editor is not None
                 editor.path = source
@@ -413,8 +499,8 @@ class ProjectLayoutTests(unittest.TestCase):
             source.write_text("before\n", encoding="utf-8")
             app = Undertow(settings_path=root / "settings.toml")
             try:
-                app._reset_workspace(source)
-                editor = app.active_editor()
+                app.services.project.reset_workspace(app, source)
+                editor = app.runtime.workspace.active_editor()
                 assert editor is not None
                 source.write_text("changed outside Undertow\n", encoding="utf-8")
 
@@ -431,8 +517,8 @@ class ProjectLayoutTests(unittest.TestCase):
             source.write_text("before\n", encoding="utf-8")
             app = Undertow(settings_path=root / "settings.toml")
             try:
-                app._reset_workspace(source)
-                editor = app.active_editor()
+                app.services.project.reset_workspace(app, source)
+                editor = app.runtime.workspace.active_editor()
                 assert editor is not None
                 editor.lines[:] = ["local Undertow edit"]
                 editor.mark_dirty()
@@ -454,8 +540,8 @@ class ProjectLayoutTests(unittest.TestCase):
             source.write_text("alpha\nbravo\ncharlie\n", encoding="utf-8")
             app = Undertow(settings_path=root / "settings.toml")
             try:
-                app._reset_workspace(source)
-                editor = app.active_editor()
+                app.services.project.reset_workspace(app, source)
+                editor = app.runtime.workspace.active_editor()
                 assert editor is not None
                 editor.lines[0] = "local alpha"
                 editor.mark_dirty()
@@ -557,7 +643,7 @@ class ProjectLayoutTests(unittest.TestCase):
             source.write_text("pass\n", encoding="utf-8")
             app = Undertow(settings_path=root / "settings.toml")
             try:
-                app._reset_workspace(source)
+                app.services.project.reset_workspace(app, source)
                 app.context_project_entry = source
                 self.assertEqual(
                     [action for action, _ in app.context_actions("project-pane")],
@@ -609,7 +695,7 @@ class ProjectLayoutTests(unittest.TestCase):
                 self.assertTrue(app.runtime.project_modal.is_open)
                 self.assertEqual(app.runtime.project_modal.mode, "creating")
                 with patch.object(app.runtime.project_modal.venv_creator, "drain_events", return_value=[VenvEvent("created", "PYTHON 3.14")]):
-                    app.drain_venv_events()
+                    app.services.project.drain_venv_events(app)
                 self.assertFalse(app.runtime.project_modal.is_open)
                 self.assertEqual(app.runtime.project.root, root / "fresh tide")
                 self.assertTrue((app.runtime.project.root / "pyproject.toml").is_file())
@@ -697,14 +783,14 @@ class ProjectLayoutTests(unittest.TestCase):
             app = Undertow()
             try:
                 app.runtime.project = project
-                app._reset_workspace(source)
-                app.active_editor().path = source
-                app.active_editor().lines = source.read_text(encoding="utf-8").splitlines()
-                app.active_editor().row = 2
-                app.active_editor().col = 3
+                app.services.project.reset_workspace(app, source)
+                app.runtime.workspace.active_editor().path = source
+                app.runtime.workspace.active_editor().lines = source.read_text(encoding="utf-8").splitlines()
+                app.runtime.workspace.active_editor().row = 2
+                app.runtime.workspace.active_editor().col = 3
                 app.runtime.workspace.split_active_pane("vertical")
                 app.runtime.workspace.choose_pane_kind(app.active_pane, "output")
-                output_pane = app.find_pane(app.root_pane, "pane-2")
+                output_pane = app.runtime.workspace.find("pane-2")
                 output_pane.view.scroll, output_pane.view.follow = 4, False
                 app.root_pane.ratio = 0.7
                 app.runtime.workspace.save()
@@ -712,14 +798,14 @@ class ProjectLayoutTests(unittest.TestCase):
                 restored = Undertow()
                 try:
                     restored.runtime.project = project
-                    restored._reset_workspace(source)
+                    restored.services.project.reset_workspace(restored, source)
                     self.assertIsNotNone(restored.runtime.workspace.load())
                     self.assertEqual(restored.root_pane.axis, "vertical")
                     self.assertEqual(restored.root_pane.ratio, 0.7)
-                    code_pane = restored.find_pane(restored.root_pane, "pane-1a")
+                    code_pane = restored.runtime.workspace.find("pane-1a")
                     self.assertEqual(code_pane.editor.path, source.resolve())
                     self.assertEqual((code_pane.editor.row, code_pane.editor.col), (2, 3))
-                    output_pane = restored.find_pane(restored.root_pane, "pane-2")
+                    output_pane = restored.runtime.workspace.find("pane-2")
                     self.assertEqual(output_pane.kind, "output")
                     self.assertEqual((output_pane.view.scroll, output_pane.view.follow), (4, False))
                 finally:

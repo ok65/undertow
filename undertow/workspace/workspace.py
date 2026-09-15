@@ -81,6 +81,27 @@ class Workspace:
                     pass
         raise KeyError(pane_id)
 
+    def active_pane(self) -> Pane:
+        """Return the active leaf, falling back cleanly only through callers."""
+        return self.find(self.active_pane_id)
+
+    def active_editor(self) -> Editor | None:
+        try:
+            return self.active_pane().editor
+        except KeyError:
+            return None
+
+    def active_editor_pane(self) -> EditorPane | None:
+        try:
+            pane = self.active_pane()
+        except KeyError:
+            return None
+        return pane.view if isinstance(pane.view, EditorPane) else None
+
+    def project_panes(self) -> list[ProjectPane]:
+        """Return all filesystem views, including independently split views."""
+        return [pane.view for pane in self.leaves() if isinstance(pane.view, ProjectPane)]
+
     def split_active_pane(self, orientation: str) -> str:
         """Split the active leaf and return the newly created chooser pane ID."""
         if orientation not in {"vertical", "horizontal"}:

@@ -46,7 +46,7 @@ class ProjectPane(Pane):
     def draw(self, renderer: Any, rect: pygame.Rect) -> None:
         """Draw this project's filesystem tree and its local controls."""
         renderer.panel(rect, renderer.pane_title("PROJ", renderer.runtime.project.name))
-        active_editor = renderer.active_editor()
+        active_editor = renderer.runtime.workspace.active_editor()
         document_path = active_editor.path.resolve() if active_editor is not None else None
         rows = self.rows(renderer.gui, rect)
         old_clip = renderer.screen.get_clip()
@@ -70,7 +70,7 @@ class ProjectPane(Pane):
         renderer.gui.button(renderer.screen, "OPEN / CREATE PROJECT", renderer.project_open_rect(rect))
 
     def pane_context_actions(self, app: Any, pane: Any = None) -> list[ContextAction]:
-        actions = [ContextAction("open_project", "OPEN / CREATE PROJECT", lambda owner, _pane: owner.show_project_modal())]
+        actions = [ContextAction("open_project", "OPEN / CREATE PROJECT", lambda owner, _pane: owner.services.project.show(owner))]
         if app.context_project_entry is not None:
             actions.append(ContextAction("explore", "EXPLORE HERE", lambda owner, _pane: owner.explore_project_entry(owner.context_project_entry)))
         return actions

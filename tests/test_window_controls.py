@@ -27,7 +27,7 @@ class WindowControlsTests(unittest.TestCase):
             app.runtime.project_modal.is_open = False
             close = app.window_state.controls.controls(app.screen.get_width())[-1]
 
-            self.assertTrue(app.pointer_over_button(close.rect.center, []))
+            self.assertTrue(app.services.gui_interaction.pointer_over_button(app, close.rect.center, []))
         finally:
             pygame.quit()
 
@@ -40,6 +40,6 @@ class WindowControlsTests(unittest.TestCase):
             entry, _depth, bounds = app.project_rows(leaves[0][1], pane)[0]
 
             self.assertTrue(entry.exists())
-            self.assertTrue(app.pointer_over_tree_item(bounds.center, leaves))
+            self.assertTrue(app.services.gui_interaction.pointer_over_tree_item(app, bounds.center, leaves))
         finally:
             pygame.quit()

@@ -6,7 +6,18 @@ from typing import Any
 
 import pygame
 
-from .panes import EditorPane, InspectorPane, ProjectPane, StructurePane
+from .input_capture import KeyEvent
+from .panes import EditorPane, InspectorPane, InterpreterPane, OutputPane, ProjectPane, StructurePane, TerminalPane, VariablesPane
+
+
+_CAPTURED_KEYS = {
+    "enter": pygame.K_RETURN, "space": pygame.K_SPACE, "tab": pygame.K_TAB,
+    "backspace": pygame.K_BACKSPACE, "delete": pygame.K_DELETE,
+    "left": pygame.K_LEFT, "right": pygame.K_RIGHT, "up": pygame.K_UP,
+    "down": pygame.K_DOWN, "home": pygame.K_HOME, "end": pygame.K_END,
+    "f5": pygame.K_F5, "f12": pygame.K_F12,
+}
+_CAPTURED_MODIFIERS = {"ctrl": pygame.KMOD_CTRL, "shift": pygame.KMOD_SHIFT, "alt": pygame.KMOD_ALT}
 
 
 class EventHandler:
@@ -23,12 +34,13 @@ class EventHandler:
         leaves: list[tuple[Any, pygame.Rect]],
     ) -> bool:
         """Handle the current event batch and return whether the app remains open."""
+        self._drain_captured_editor_input()
         for event in pygame.event.get():
             self.app.last_interaction_tick = pygame.time.get_ticks()
             if event.type == pygame.KEYDOWN and event.key == pygame.K_F12 and event.mod & pygame.KMOD_CTRL and event.mod & pygame.KMOD_SHIFT:
                 self.app.toggle_performance_capture()
                 continue
-            consumed, close_requested = self.app.handle_window_chrome_event(event)
+            consumed, close_requested = self.app.services.window.handle_event(event, self.app.screen.get_size())
             if close_requested:
                 alive = False
                 continue
@@ -39,38 +51,52 @@ class EventHandler:
             elif self.app.runtime.project_modal.is_open:
                 self._project_modal_event(event)
             elif event.type == pygame.KEYDOWN and self.app.focus == "search":
-                self.app.search_key(event)
+                editor = self.app.runtime.workspace.active_editor()
+                if editor is not None:
+                    self.app.services.search.handle_key(self.app, editor, event)
             elif event.type == pygame.TEXTINPUT and self.app.focus == "search":
-                self.app.search_text(event.text)
+                self.app.services.search.handle_text(self.app, event.text)
             elif event.type == pygame.KEYDOWN and self.app.focus == "editor":
-                pane = self.app.active_editor_pane()
+                if self._captured_input_active():
+                    continue
+                pane = self.app.runtime.workspace.active_editor_pane()
                 if pane is None:
                     self.app.focus = "sidebar"
                     continue
                 if event.key == pygame.K_f and event.mod & pygame.KMOD_CTRL:
-                    self.app.open_search()
+                    self.app.services.search.open(self.app, pane.editor)
                     self.app.focus = "search"
                     continue
                 if event.key == pygame.K_h and event.mod & pygame.KMOD_CTRL:
-                    self.app.open_search(replace=True)
+                    self.app.services.search.open(self.app, pane.editor, replace=True)
                     self.app.focus = "search"
                     continue
                 self.app.handle_key(event, pane)
                 pane.ensure_caret_visible(self.app, self.app.layout_state.pane_rects[self.app.active_pane])
             elif event.type == pygame.TEXTINPUT and self.app.focus == "editor":
-                editor = self.app.active_editor()
+                if self._captured_input_active():
+                    continue
+                editor = self.app.runtime.workspace.active_editor()
                 if editor is None:
                     self.app.focus = "sidebar"
                     continue
                 self.app.handle_text(event.text, editor)
             elif event.type == pygame.KEYDOWN and self.app.focus == "terminal":
-                self.app.handle_terminal_key(event)
+                terminal = self._active_view(TerminalPane)
+                if terminal is not None:
+                    terminal.handle_key(event, self.app.services.terminal_manager, self.app.runtime.project.root, self.app.doom_launcher)
             elif event.type == pygame.TEXTINPUT and self.app.focus == "terminal":
-                self.app.handle_terminal_text(event.text)
+                terminal = self._active_view(TerminalPane)
+                if terminal is not None:
+                    terminal.handle_text(event.text)
             elif event.type == pygame.KEYDOWN and self.app.focus == "interpreter":
-                self.app.handle_interpreter_key(event)
+                interpreter = self._active_view(InterpreterPane)
+                if interpreter is not None:
+                    interpreter.handle_key(event, self.app.execution)
             elif event.type == pygame.TEXTINPUT and self.app.focus == "interpreter":
-                self.app.handle_interpreter_text(event.text)
+                interpreter = self._active_view(InterpreterPane)
+                if interpreter is not None:
+                    interpreter.handle_text(event.text)
             elif event.type == pygame.MOUSEWHEEL:
                 self._wheel(pygame.mouse.get_pos(), leaves, output_rect, event.y, event.x)
             elif event.type == pygame.MOUSEBUTTONDOWN:
@@ -81,9 +107,69 @@ class EventHandler:
                 self._button_up(event)
         return alive
 
+    def _captured_input_active(self) -> bool:
+        capture = getattr(self.app.services, "keyboard_capture", None)
+        return bool(capture is not None and capture.active)
+
+    def _active_view(self, view_type: type[Any]) -> Any | None:
+        """Resolve the focused pane's concrete view without app-level wrappers."""
+        try:
+            pane = self.app.runtime.workspace.find(self.app.active_pane)
+        except KeyError:
+            return None
+        return pane.view if isinstance(pane.view, view_type) else None
+
+    def _drain_captured_editor_input(self) -> None:
+        """Apply backlog from the capture process before touching SDL events."""
+        capture = getattr(self.app.services, "keyboard_capture", None)
+        if capture is None or not capture.active:
+            return
+        events = capture.client.poll()
+        # Do not let keystrokes typed into a modal, tree, terminal, or search
+        # arrive later in a code buffer when focus changes.
+        if self.app.runtime.project_modal.is_open or self.app.focus != "editor":
+            return
+        pane = self.app.runtime.workspace.active_editor_pane()
+        if pane is None:
+            return
+        for event in events:
+            if event.type == "text":
+                self.app.handle_text(event.text, pane.editor)
+                continue
+            if event.type != "down":
+                continue
+            pygame_event = self._pygame_key_event(event)
+            if pygame_event is None:
+                continue
+            if pygame_event.key == pygame.K_f and pygame_event.mod & pygame.KMOD_CTRL:
+                self.app.services.search.open(self.app, pane.editor)
+                self.app.focus = "search"
+                continue
+            if pygame_event.key == pygame.K_h and pygame_event.mod & pygame.KMOD_CTRL:
+                self.app.services.search.open(self.app, pane.editor, replace=True)
+                self.app.focus = "search"
+                continue
+            self.app.handle_key(pygame_event, pane)
+            pane.ensure_caret_visible(self.app, self.app.layout_state.pane_rects[self.app.active_pane])
+
+    @staticmethod
+    def _pygame_key_event(event: KeyEvent) -> pygame.event.Event | None:
+        if not event.key:
+            return None
+        key = _CAPTURED_KEYS.get(event.key)
+        if key is None:
+            try:
+                key = pygame.key.key_code(event.key)
+            except ValueError:
+                return None
+        modifiers = 0
+        for name in event.modifiers:
+            modifiers |= _CAPTURED_MODIFIERS.get(name, 0)
+        return pygame.event.Event(pygame.KEYDOWN, key=key, mod=modifiers)
+
     def _project_modal_event(self, event: pygame.event.Event) -> None:
         """Keep the startup project gate modal until a project is selected."""
-        self.app.runtime.project_modal.handle_event(event, self.app.open_project_folder)
+        self.app.runtime.project_modal.handle_event(event, lambda folder: self.app.services.project.open_folder(self.app, folder))
 
     def _wheel(
         self, position: tuple[int, int], leaves: list[tuple[Any, pygame.Rect]], output_rect: pygame.Rect, delta: int, horizontal_delta: int = 0,
@@ -95,7 +181,7 @@ class EventHandler:
         inspector = next(((pane, rect) for pane, rect in leaves if pane.kind == "inspector" and rect.collidepoint(position)), None)
         interpreter = next(((pane, rect) for pane, rect in leaves if pane.kind == "interpreter" and rect.collidepoint(position)), None)
         terminal = next(((pane, rect) for pane, rect in leaves if pane.kind == "terminal" and rect.collidepoint(position)), None)
-        if horizontal_delta and self.app.scroll_editor_under_pointer(position, leaves, 0, horizontal_delta):
+        if horizontal_delta and self._scroll_editor_under_pointer(position, leaves, 0, horizontal_delta):
             return
         if project is not None:
             if isinstance(project[0].view, ProjectPane):
@@ -103,7 +189,8 @@ class EventHandler:
         elif output is not None:
             self.app.focus = "output"
             self.app.active_pane = output[0].pane_id
-            self.app.scroll_output(output[0], output[1], delta)
+            if isinstance(output[0].view, OutputPane):
+                output[0].view.scroll_by_wheel(self.app.output, output[1], delta)
         elif structure is not None:
             if isinstance(structure[0].view, StructurePane):
                 structure[0].view.scroll(self.app, structure[1], -delta * 3)
@@ -111,13 +198,26 @@ class EventHandler:
             if isinstance(inspector[0].view, InspectorPane):
                 inspector[0].view.scroll(self.app, inspector[1], -delta * 3)
         elif terminal is not None:
-            self.app.scroll_terminal(terminal[0].pane_id, terminal[1], -delta * 3)
+            if isinstance(terminal[0].view, TerminalPane):
+                terminal[0].view.scroll_by(terminal[1], -delta * 3)
         elif interpreter is not None:
-            self.app.scroll_interpreter(interpreter[0], interpreter[1], -delta * 3)
+            if isinstance(interpreter[0].view, InterpreterPane):
+                interpreter[0].view.scroll_by(interpreter[1], -delta * 3)
         elif variables is not None:
-            self.app.scroll_variables(variables[0], variables[1], -delta * 3)
-        elif not self.app.scroll_editor_under_pointer(position, leaves, delta) and output_rect.collidepoint(position):
+            if isinstance(variables[0].view, VariablesPane):
+                variables[0].view.scroll(self.app, variables[1], -delta * 3)
+        elif not self._scroll_editor_under_pointer(position, leaves, delta) and output_rect.collidepoint(position):
             self.app.focus = "output"
+
+    def _scroll_editor_under_pointer(
+        self, position: tuple[int, int], leaves: list[tuple[Any, pygame.Rect]], wheel_delta: int, horizontal_delta: int = 0,
+    ) -> bool:
+        """Route a wheel event to its owning editor pane, if any."""
+        hovered = next(((pane, rect) for pane, rect in leaves if pane.kind == "code" and rect.collidepoint(position)), None)
+        if hovered is None or not isinstance(hovered[0].view, EditorPane):
+            return False
+        hovered[0].view.scroll_under_pointer(self.app, hovered[1], wheel_delta, horizontal_delta)
+        return True
 
     def _button_down(self, event: pygame.event.Event, sidebar: pygame.Rect, output_rect: pygame.Rect, leaves: list[tuple[Any, pygame.Rect]]) -> None:
         if event.button in (4, 5):
@@ -154,7 +254,8 @@ class EventHandler:
                             self.app.focus = "editor"
                         elif choice == "terminal":
                             self.app.focus = "terminal"
-                            self.app.ensure_terminal(replacement.pane_id)
+                            if isinstance(replacement.view, TerminalPane):
+                                self.app.services.terminal_manager.ensure(replacement.view, self.app.runtime.project.root)
                         self.app.status = f"{choice.upper()} PANE OPEN"
                 return
             if pane.kind == "project":
@@ -165,7 +266,8 @@ class EventHandler:
                 return
             if pane.kind == "variables":
                 self.app.focus = "debug"
-                self.app.handle_variable_click(pane, rect, event.pos)
+                if isinstance(pane.view, VariablesPane):
+                    pane.view.handle_click(self.app, rect, event.pos)
                 return
             if pane.kind == "structure":
                 self.app.focus = "structure"
@@ -188,7 +290,7 @@ class EventHandler:
             if not isinstance(pane.view, EditorPane):
                 return
             self.app.runtime.last_code_pane_id = pane.pane_id
-            if self.app.handle_code_header_click(pane.pane_id, rect, event.pos):
+            if pane.view.handle_code_header_click(self.app, rect, event.pos):
                 self.app.focus = "editor"
                 return
             if pane.view.toggle_fold_at(rect, event.pos):
@@ -210,7 +312,7 @@ class EventHandler:
 
     def _mouse_motion(self, event: pygame.event.Event) -> None:
         if self.app.drag_selecting:
-            pane = self.app.active_editor_pane()
+            pane = self.app.runtime.workspace.active_editor_pane()
             if pane is not None:
                 pane.place_caret(self.app, event.pos, self.app.layout_state.pane_rects[self.app.active_pane], extend_selection=True)
         elif self.app.layout_state.dragging_horizontal_scroll:
@@ -224,7 +326,7 @@ class EventHandler:
 
     def _button_up(self, event: pygame.event.Event) -> None:
         if self.app.drag_selecting:
-            pane = self.app.active_editor_pane()
+            pane = self.app.runtime.workspace.active_editor_pane()
             if pane is not None:
                 pane.place_caret(self.app, event.pos, self.app.layout_state.pane_rects[self.app.active_pane], extend_selection=True)
         self.app.drag_selecting = False

@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+import pygame
+
 
 @dataclass
 class WindowState:
@@ -50,6 +52,13 @@ class ServiceState:
     execution: Any
     debugger: Any
     debugging: Any | None = None
+    keyboard_capture: Any | None = None
+    terminal_manager: Any | None = None
+    search: Any | None = None
+    execution_ui: Any | None = None
+    project: Any | None = None
+    window: Any | None = None
+    gui_interaction: Any | None = None
 
 
 @dataclass
@@ -61,8 +70,6 @@ class WorkspaceRuntime:
     project_modal: Any
     documents: Any | None = None
     last_code_pane_id: str = "pane-1"
-    terminal_panes: dict[str, Any] = field(default_factory=dict)
-    terminal_sessions: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -87,6 +94,30 @@ class WorkspaceLayoutState:
 
     def divider_at(self, position: tuple[int, int]) -> Any | None:
         return next(((pane, parent) for pane, rect, parent in self.dividers if rect.collidepoint(position)), None)
+
+    def leaf_layout(self, pane: Any, rect: pygame.Rect) -> list[tuple[Any, pygame.Rect]]:
+        """Lay out a recursive pane tree and record its draggable split walls."""
+        if pane.is_leaf:
+            return [(pane, rect)]
+        gap = 8
+        if pane.axis == "vertical":
+            usable_width = max(2, rect.w - gap)
+            minimum_width = min(160, usable_width // 2)
+            first_width = max(minimum_width, min(usable_width - minimum_width, round(usable_width * pane.ratio)))
+            first = pygame.Rect(rect.x, rect.y, first_width, rect.h)
+            actual_gap = max(0, rect.w - usable_width)
+            second = pygame.Rect(first.right + actual_gap, rect.y, usable_width - first_width, rect.h)
+            divider = pygame.Rect(first.right, rect.y, actual_gap, rect.h)
+        else:
+            usable_height = max(2, rect.h - gap)
+            minimum_height = min(110, usable_height // 2)
+            first_height = max(minimum_height, min(usable_height - minimum_height, round(usable_height * pane.ratio)))
+            first = pygame.Rect(rect.x, rect.y, rect.w, first_height)
+            actual_gap = max(0, rect.h - usable_height)
+            second = pygame.Rect(rect.x, first.bottom + actual_gap, rect.w, usable_height - first_height)
+            divider = pygame.Rect(rect.x, first.bottom, rect.w, actual_gap)
+        self.record_divider(pane, divider, rect)
+        return self.leaf_layout(pane.first, first) + self.leaf_layout(pane.second, second)
 
 
 @dataclass

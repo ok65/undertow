@@ -10,6 +10,7 @@ import pygame
 
 from undertow.editor import Editor
 from undertow.gui_elements import LargeTextBuffer
+from undertow.panes.debug_controls import DebugControl, DebugControlsPane
 from undertow.theme import (
     BLACK,
     CYAN,
@@ -150,6 +151,59 @@ class EditorPane(Pane):
         self.editor.target_scroll += lines
         self.clamp_scroll(renderer, rect)
 
+    def update_smooth_scroll(self, renderer: Any, rect: pygame.Rect, delta_ms: int) -> None:
+        """Ease this viewport toward wheel input without delaying caret moves."""
+        ease = min(1.0, delta_ms / 140)
+        difference = self.editor.target_scroll - self.editor.scroll
+        self.editor.scroll = self.editor.target_scroll if abs(difference) < 0.01 else self.editor.scroll + difference * ease
+        self.clamp_scroll(renderer, rect)
+
+    def scroll_under_pointer(self, renderer: Any, rect: pygame.Rect, wheel_delta: int, horizontal_delta: int = 0) -> None:
+        """Apply native horizontal or vertical wheel input to this code view."""
+        renderer.active_pane, renderer.focus = self.pane_id, "editor"
+        if horizontal_delta:
+            self.editor.horizontal_scroll += horizontal_delta * 80
+            self.clamp_scroll(renderer, rect)
+        elif pygame.key.get_mods() & pygame.KMOD_SHIFT:
+            self.editor.horizontal_scroll -= wheel_delta * 80
+            self.clamp_scroll(renderer, rect)
+        else:
+            self.scroll(renderer, rect, -wheel_delta * 3)
+
+    def code_header_controls(self, renderer: Any, rect: pygame.Rect) -> list[tuple[DebugControl, pygame.Rect]]:
+        """Build title-rail execution controls for this specific code pane."""
+        controls: list[DebugControl] = [DebugControl("run", "RUN", not renderer.execution.is_running)]
+        state = renderer.execution.debug_state
+        if state != "idle" and self.pane_id != renderer.runtime.last_code_pane_id:
+            controls.append(DebugControl("attached", "DEBUG:// ATTACHED", enabled=False))
+        else:
+            if state != "idle":
+                controls.append(DebugControl("state", f"DEBUG:// {state.upper()}", enabled=False))
+            controls.extend(DebugControlsPane.controls(state))
+        widths = [renderer.gui.button_size(control.label, (0, 26))[0] for control in controls]
+        x = max(rect.x + 185, rect.right - 10 - sum(widths))
+        return [
+            (control, renderer.gui.button_rect(control.label, pygame.Rect(x + sum(widths[:index]), rect.y + 6, width, 26)))
+            for index, (control, width) in enumerate(zip(controls, widths, strict=True))
+        ]
+
+    def handle_code_header_click(self, renderer: Any, rect: pygame.Rect, position: tuple[int, int]) -> bool:
+        control = next((item for item, bounds in self.code_header_controls(renderer, rect) if bounds.collidepoint(position)), None)
+        if control is None or not control.enabled:
+            return False
+        actions = {
+            "run": renderer.services.debugging.run_code,
+            "start": renderer.services.debugging.debug_code,
+            "continue": renderer.execution.debug_continue,
+            "next": renderer.execution.debug_step_over,
+            "step_in": renderer.execution.debug_step_in,
+            "stop": renderer.execution.stop,
+        }
+        handler = actions.get(control.action)
+        if handler is not None:
+            handler()
+        return True
+
     def place_caret(self, renderer: Any, position: tuple[int, int], rect: pygame.Rect, extend_selection: bool = False) -> None:
         """Place this editor's caret on the nearest character to a click."""
         content_top = rect.y + 44
@@ -267,7 +321,7 @@ class EditorPane(Pane):
             renderer.pane_title("CODE", f"{editor.path.name}{' *' if editor.dirty else ''}{change_marker}"),
             renderer.focus == "editor" and renderer.active_pane == self.pane_id,
         )
-        for control, bounds in renderer.code_header_controls(rect, self.pane_id):
+        for control, bounds in self.code_header_controls(renderer, rect):
             renderer.gui.button(renderer.screen, control.label, bounds, control.enabled)
         if renderer.search_open and renderer.active_pane == self.pane_id:
             label = "REPLACE" if renderer.search_replace_mode else "FIND"

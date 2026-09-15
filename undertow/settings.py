@@ -22,6 +22,7 @@ class UndertowSettings(MutableMapping[str, Any]):
         "project_inspection_interval_ms": 30_000,
         "target_fps": 30,
         "idle_fps": 10,
+        "keyboard_capture_enabled": True,
     }
     MAX_RECENT_PROJECTS = 10
 

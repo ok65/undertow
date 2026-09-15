@@ -82,13 +82,13 @@ class InspectorPane(Pane):
             renderer.status = "NO FILE AVAILABLE FOR THIS PROJECT CHECK"
             return False
         renderer.open_project_file(offender.path)
-        editor = renderer.active_editor()
+        editor = renderer.runtime.workspace.active_editor()
         if editor is not None:
             editor.row = max(0, min(offender.line, len(editor.lines) - 1))
             editor.col = 0
             pane_rect = renderer.pane_rects.get(renderer.active_pane)
             if pane_rect is not None:
-                pane = renderer.active_editor_pane()
+                pane = renderer.runtime.workspace.active_editor_pane()
                 if pane is not None:
                     pane.ensure_caret_visible(renderer, pane_rect)
         return True
